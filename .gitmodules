@@ -1,6 +1,6 @@
 [submodule "libultraship"]
 	path = libultraship
-	url = https://github.com/roborich/libultraship.git
+	url = https://github.com/julainoloca00-dot/libultraship-Shadow_Map.git
 	branch = wind-waker-style-cel-shading
 [submodule "ZAPDTR"]
 	path = ZAPDTR
