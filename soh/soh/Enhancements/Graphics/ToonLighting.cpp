@@ -132,7 +132,6 @@ static bool ToonActorExcluded(Actor* actor) {
         case ACTOR_BG_TREEMOUTH:  // Great Deku Tree (very tall)
         case ACTOR_BG_MIZU_WATER: // water-box surfaces
         case ACTOR_BG_HAKA_WATER:
-        case ACTOR_EN_WOOD02:  // trees / bushes / leaf scenery
         case ACTOR_OBJ_SWITCH: // floor/crystal/eye switches — environment fixtures, not relit objects.
         case ACTOR_OBJ_BEAN:   // magic bean plant/platform — same. Both are also RECEIVERS below, so
                                // they still catch other actors' shadows like the ground does.
@@ -209,6 +208,12 @@ static bool ToonShadowReceiver(Actor* actor) {
 // rationale per id inline. Shadow receivers are excluded too: a walkable floor casting its own silhouette down
 // into the void below reads wrong, and (now that it sits in the depth buffer at flush time) could self-shadow.
 static bool ToonShadowExcluded(Actor* actor) {
+    // Trees are receiver actors, but unlike platforms they must also cast: the opaque stream captures
+    // trunks and the XLU stream captures the geometric foliage cards. Other receivers remain excluded
+    // to avoid self-shadowing their own walkable surfaces.
+    if (actor->id == ACTOR_EN_WOOD02) {
+        return false;
+    }
     switch (actor->id) {
         case ACTOR_EN_KUSA:      // small cuttable grass — everywhere and tiny, a blob per tuft reads wrong
         case ACTOR_EN_SKJ:       // Skull Kid
@@ -730,7 +735,8 @@ static void HandleActorDraw(void* actorPtr) {
         return; // hooks stay registered so console toggles work; the per-frame snapshot gates the work
     }
 
-    // Blacklist (doors/trees/water): excluded actors get neither cel relight nor a shadow. When cel shading
+     // Blacklist (doors/water/oversized scenery): excluded actors get neither cel relight nor a shadow. Trees
+    // intentionally stay in the normal path so trunks and foliage receive lighting and cast into the map. When cel shading
     // is on, flip its bracket OFF around them (deduped via sToonEnabled) so they keep vanilla lighting; the
     // next normal actor flips it back ON. The bracket only exists while cel shading is on, so skip the flip
     // otherwise (a shadow alone never relights). Own disp scope so excluded actors return cleanly without an
@@ -755,6 +761,7 @@ static void HandleActorDraw(void* actorPtr) {
         if (shadowsEnabled) {
             OPEN_DISPS(play->state.gfxCtx);
             gSPToonShadow(POLY_OPA_DISP++, 0, 0, 0, 0.0f);
+            gSPToonShadow(POLY_XLU_DISP++, 0, 0, 0, 0.0f);
             CLOSE_DISPS(play->state.gfxCtx);
         }
         return;
@@ -882,8 +889,19 @@ static void HandleActorDraw(void* actorPtr) {
             f32 clampY = floorHeight < -32767.0f ? -32767.0f : (floorHeight > 32767.0f ? 32767.0f : floorHeight);
             s16 feetClamp = ToonShadowDeepRooted(actor) ? (s16)clampY : (s16)TOON_SHADOW_NO_CLAMP;
             gSPToonShadowArm(POLY_OPA_DISP++, feetClamp, st.shadowScale); // planeD = eased size scale
+            if (actor->id == ACTOR_EN_WOOD02) {
+                // Tree canopies are submitted through POLY_XLU. Arm that stream only for En_Wood02 so
+                // foliage geometry contributes to the directional depth map without making particles,
+                // water, fairy effects, or other translucent actors cast solid shadows.
+                gSPToonShadowArm(POLY_XLU_DISP++, feetClamp, st.shadowScale);
+            } else {
+                // A previous tree may have armed the deferred XLU stream; every following actor closes
+                // that boundary explicitly so its translucent effects cannot leak into the tree shadow.
+                gSPToonShadow(POLY_XLU_DISP++, 0, 0, 0, 0.0f);
+            }
         } else {
             gSPToonShadow(POLY_OPA_DISP++, 0, 0, 0, 0.0f); // fully off
+            gSPToonShadow(POLY_XLU_DISP++, 0, 0, 0, 0.0f);
         }
     } else {
         // Shadows off (cel still on): keep the eased size at zero so re-enabling grows the shadow in
