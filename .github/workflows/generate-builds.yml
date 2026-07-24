@@ -1,15 +1,13 @@
-name: Windows manual build
+name: Windows artifact build
 
 on:
   workflow_dispatch:
-  push:
+  pull_request:
     branches:
       - wind-waker-style-cel-shading
-    paths-ignore:
-      - .github/windows-build-success.txt
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -179,19 +177,6 @@ jobs:
           path: soh-windows
           if-no-files-found: error
           retention-days: 3
-
-      - name: Record successful Windows artifact
-        shell: pwsh
-        run: |
-          "run_id=${{ github.run_id }}" | Set-Content ".github/windows-build-success.txt"
-          "commit=${{ github.sha }}" | Add-Content ".github/windows-build-success.txt"
-          "artifact=soh-windows" | Add-Content ".github/windows-build-success.txt"
-          "completed_at=$((Get-Date).ToUniversalTime().ToString('o'))" | Add-Content ".github/windows-build-success.txt"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .github/windows-build-success.txt
-          git commit -m "Record successful Windows artifact [skip ci]"
-          git push
 
       - name: Save Cache VCPKG folder
         if: ${{ github.ref_name == github.event.repository.default_branch }}
