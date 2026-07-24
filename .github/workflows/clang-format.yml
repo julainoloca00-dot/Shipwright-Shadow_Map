@@ -4,11 +4,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: write
-  actions: read
-  pull-requests: write
-
 jobs:
   clang-format:
     runs-on: ubuntu-latest
@@ -21,8 +16,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang-format-14
       - name: Run clang-format
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           ./run-clang-format.sh
           git diff --exit-code
