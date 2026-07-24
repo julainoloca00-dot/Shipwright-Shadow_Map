@@ -263,6 +263,7 @@ static s8 sLastKeyDir[3];
 static u8 sLastKeyCol[3];
 
 static void ToonClearKeyStates(); // defined with the key-state map below
+static void ToonEnvKey(PlayState* play, f32 dirOut[3], f32 colOut[3]); // stable world-shadow light
 
 // Runs once per frame (game-frame-update hook, after the frame's draw). Pushes the frame-global ramp
 // shape to the renderer and clears the per-pass key-dedup state so the next frame's first actor
@@ -272,6 +273,26 @@ static void OnToonFrameUpdate() {
     // Refresh the per-frame CVar snapshot first: everything below (and every HandleActorDraw this
     // frame) reads the cached values, so a toggle from the menu OR the console lands within a frame.
     RefreshFrameParams();
+
+    // Dynamic shadow mapping uses one stable directional light and one stable world-space anchor.
+    // Do this before the early-out so disabling shadows immediately stops environment capture and
+    // clears any previous-frame caster data in the renderer.
+    if (auto interp = GetInterpreter()) {
+        f32 shadowDir[3] = { 0.30f, 1.0f, 0.20f };
+        f32 shadowColor[3] = { 1.0f, 1.0f, 1.0f };
+        f32 shadowAnchor[3] = { 0.0f, 0.0f, 0.0f };
+        if (gPlayState != NULL) {
+            ToonEnvKey(gPlayState, shadowDir, shadowColor);
+            Player* player = GET_PLAYER(gPlayState);
+            if (player != NULL) {
+                shadowAnchor[0] = player->actor.world.pos.x;
+                shadowAnchor[1] = player->actor.world.pos.y;
+                shadowAnchor[2] = player->actor.world.pos.z;
+            }
+        }
+        interp->SetDynamicShadowCaptureState(sParams.shadows, shadowDir, shadowAnchor);
+    }
+
     // Clear before any early-out, so the dedup state resets even on a headless window (no renderer).
     sHaveLastKey = false;
     // The bracket re-opens toon ON each frame; match it so the first blacklisted actor toggles correctly.
