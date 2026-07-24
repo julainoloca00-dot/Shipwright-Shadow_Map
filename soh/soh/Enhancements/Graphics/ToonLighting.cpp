@@ -786,18 +786,15 @@ static void HandleActorDraw(void* actorPtr) {
         }
     }
 
-    // Actor shadow: arm this actor's drop shadow. The renderer builds a stencil volume from the actor's
-    // captured silhouette and casts it along the key just snapshotted (gSPToonKey above) onto the real ground,
-    // so it conforms to slopes and always agrees with the cel shading. POLY_OPA only, so translucent effects
-    // don't cast. Emitted for every non-excluded actor when on (zero normal disarms it) so the per-object
-    // boundary is always marked and the previous actor's capture can't leak into this one.
+    // Actor shadow: arm this actor as a dynamic shadow-map caster. The renderer captures the actor's
+    // opaque world-space triangles and rasterizes them into the shared low-resolution directional depth map.
+    // Translucent effects do not cast. Emitting a zero normal disarms capture and keeps actor boundaries strict.
     if (shadowsEnabled) {
         // The shadow shows when the actor is on/near the ground, within the render-distance cull, and NOT on a
         // wall — climbing a ladder/vine or climbing/hanging off a ledge, where it's flat against a vertical
-        // surface and the ground shadow's slab would cut into the wall and leave broken lines. Rather than pop
-        // on/off, the SIZE eases 0..1 (like Navi's light) so it grows in / shrinks to nothing. The eased scale
-        // rides in planeD; the renderer scales the footprint by it (it ignores the floor plane otherwise), and
-        // any nonzero normal simply arms the pass. A zero normal fully disarms it (no capture/projection/draw).
+        // surface and a projected ground shadow would cut into the wall. The existing eased state is retained
+        // for compatibility with the arming logic; any nonzero normal enables caster capture, while a zero
+        // normal fully disarms it.
         f32 maxDist = sParams.maxDist;
         bool onWall = false;
         if (actor->id == ACTOR_PLAYER) {
@@ -807,10 +804,15 @@ static void HandleActorDraw(void* actorPtr) {
         }
         bool hasFloor = false;
         f32 floorHeight = actor->floorHeight;
-        // The lower bound matters with the extended-culling enhancements: they draw actors BEHIND the
-        // camera (negative projected z), which would otherwise pay full capture + volume cost for a
-        // shadow that is never visible.
-        if (!ToonShadowExcluded(actor) && actor->projectedPos.z < maxDist && actor->projectedPos.z > -100.0f) {
+        // Frustum culling for shadow casters: use the engine's real camera-volume result instead of
+        // relying only on projected Z. Extended draw-distance options may still submit off-screen actors,
+        // but they no longer pay geometry capture, shadow-map rasterization, or PCF resolve coverage.
+        // The player is kept as a safe exception because first-person/cutscene camera modes can briefly
+        // update the actor culling flag after the player draw decision.
+        const bool shadowCasterInCameraFrustum =
+            actor->id == ACTOR_PLAYER || (actor->flags & ACTOR_FLAG_INSIDE_CULLING_VOLUME) != 0;
+        if (!ToonShadowExcluded(actor) && shadowCasterInCameraFrustum && actor->projectedPos.z < maxDist &&
+            actor->projectedPos.z > -100.0f) {
             // Floor reference is the gate + a "near the ground" sanity check, and the feet-clamp Y for
             // deep-rooted actors (the renderer otherwise builds the volume from the captured feet, not this
             // plane). Most actors expose actor->floorPoly from their bg check; a few (e.g. the Courtyard Guards,
