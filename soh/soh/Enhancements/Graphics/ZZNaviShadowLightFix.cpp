@@ -1,12 +1,9 @@
-// Corrective world-shadow light policy for Navi.
-// Revision: receiver-to-light direction, no radial shadow halo, and no fairy caster geometry.
+// Corrective world-shadow policy for Navi.
 //
-// ToonLighting.cpp originally forwards Navi as a radial shadow-opacity mask. That creates a circular
-// light/dark boundary and can visually resemble a shadow emitted by the fairy. This module runs after
-// ToonLighting.cpp's hooks and replaces that state with a directional approximation of a point light:
-// the vector is computed from Link toward Navi, shadows project away from the fairy, and their opacity is
-// reduced mainly in dark environments. It also disarms both actor streams before Navi draws so the light
-// source itself can never be captured as shadow-casting geometry.
+// Navi may still contribute to the normal toon-light selection, but she must never change the global
+// directional shadow-map light, create a radial shadow/fill halo, or submit fairy geometry as a caster.
+// This file sorts after ToonLighting.cpp and therefore applies the final world-shadow state each frame
+// and the final caster state immediately before Navi draws.
 
 #include <algorithm>
 #include <cmath>
@@ -56,7 +53,7 @@ void NormalizeOrDefault(float direction[3]) {
     direction[2] *= inverseLength;
 }
 
-void ReadEnvironmentKey(PlayState* play, float direction[3], float* luminance) {
+void ReadEnvironmentDirection(PlayState* play, float direction[3]) {
     LightInfo* sun = &play->envCtx.dirLight1;
     LightInfo* moon = &play->envCtx.dirLight2;
     const int sunLuminance = sun->params.dir.color[0] + sun->params.dir.color[1] + sun->params.dir.color[2];
@@ -67,80 +64,36 @@ void ReadEnvironmentKey(PlayState* play, float direction[3], float* luminance) {
     direction[1] = environment->params.dir.y;
     direction[2] = environment->params.dir.z;
     NormalizeOrDefault(direction);
-
-    *luminance = std::clamp((environment->params.dir.color[0] + environment->params.dir.color[1] +
-                             environment->params.dir.color[2]) /
-                                (3.0f * 255.0f),
-                            0.0f, 1.0f);
 }
 
-void ApplyNaviShadowLightFix() {
+void ApplyNaviShadowPolicy() {
     auto interpreter = GetShadowInterpreter();
-    if (interpreter == nullptr) {
-        return;
-    }
-
-    const bool shadowsEnabled =
-        CVarGetInteger(CVAR_ENHANCEMENT("Graphics.WorldShadows.Enabled"), 0) != 0;
-    if (!shadowsEnabled) {
+    if (interpreter == nullptr ||
+        CVarGetInteger(CVAR_ENHANCEMENT("Graphics.WorldShadows.Enabled"), 0) == 0) {
         return;
     }
 
     float shadowDirection[3] = { 0.30f, 1.00f, 0.20f };
     float shadowAnchor[3] = { 0.0f, 0.0f, 0.0f };
-    float environmentLuminance = 1.0f;
-    float naviInfluence = 0.0f;
 
     if (gPlayState != nullptr) {
-        ReadEnvironmentKey(gPlayState, shadowDirection, &environmentLuminance);
+        ReadEnvironmentDirection(gPlayState, shadowDirection);
 
         Player* player = GET_PLAYER(gPlayState);
         if (player != nullptr) {
             shadowAnchor[0] = player->actor.world.pos.x;
             shadowAnchor[1] = player->actor.world.pos.y;
             shadowAnchor[2] = player->actor.world.pos.z;
-
-            Actor* naviActor = player->naviActor;
-            const bool useNaviLight =
-                CVarGetInteger(CVAR_ENHANCEMENT("Graphics.ToonLighting.UseNaviLight"), 1) != 0;
-            if (useNaviLight && naviActor != nullptr && naviActor->id == ACTOR_EN_ELF &&
-                naviActor->params == FAIRY_NAVI) {
-                // Direction expected by the shadow map is receiver -> light. Using the opposite vector
-                // makes the shadow lean toward Navi and visually reads as darkness emitted by the fairy.
-                float naviDirection[3] = {
-                    naviActor->world.pos.x - shadowAnchor[0],
-                    naviActor->world.pos.y - shadowAnchor[1],
-                    naviActor->world.pos.z - shadowAnchor[2],
-                };
-                const float naviLengthSquared = naviDirection[0] * naviDirection[0] +
-                                                naviDirection[1] * naviDirection[1] +
-                                                naviDirection[2] * naviDirection[2];
-                if (naviLengthSquared > 0.000001f) {
-                    NormalizeOrDefault(naviDirection);
-
-                    // Navi becomes the dominant key mainly when the environmental light is weak.
-                    // Daylight keeps 10% influence; a fully dark scene reaches 90%.
-                    const float darkness = 1.0f - environmentLuminance;
-                    naviInfluence = 0.10f + darkness * 0.80f;
-
-                    shadowDirection[0] += (naviDirection[0] - shadowDirection[0]) * naviInfluence;
-                    shadowDirection[1] += (naviDirection[1] - shadowDirection[1]) * naviInfluence;
-                    shadowDirection[2] += (naviDirection[2] - shadowDirection[2]) * naviInfluence;
-                    NormalizeOrDefault(shadowDirection);
-                }
-            }
         }
     }
 
-    // Radius zero disables the old radial opacity subtraction, removing the artificial ring around Navi.
-    const float disabledRadialLight[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-    interpreter->SetDynamicShadowCaptureState(true, shadowDirection, shadowAnchor, disabledRadialLight);
+    // A zero radius removes the local shadow-opacity/fill circle that followed Navi. The world shadow
+    // direction remains tied only to the current sun or moon and can no longer rotate with the fairy.
+    const float disabledLocalLight[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    interpreter->SetDynamicShadowCaptureState(true, shadowDirection, shadowAnchor, disabledLocalLight);
 
-    // Reapply the normal shadow settings after ToonLighting.cpp, attenuating only the final environment
-    // shadow strength. At maximum night influence, roughly half of the directional darkness remains.
-    float opacity = CVarGetFloat(CVAR_ENHANCEMENT("Graphics.WorldShadows.Opacity"), 0.20f);
-    opacity *= 1.0f - 0.55f * naviInfluence;
-
+    // Preserve the user's normal shadow settings. No Navi-dependent opacity reduction is applied.
+    const float opacity = CVarGetFloat(CVAR_ENHANCEMENT("Graphics.WorldShadows.Opacity"), 0.20f);
     const float length = CVarGetFloat(CVAR_ENHANCEMENT("Graphics.WorldShadows.Length"), 0.20f);
     const float slabDepth = CVarGetFloat(CVAR_ENHANCEMENT("Graphics.WorldShadows.SlabDepth"), 8.0f);
     const float slabRise = CVarGetFloat(CVAR_ENHANCEMENT("Graphics.WorldShadows.SlabRise"), 8.0f);
@@ -155,29 +108,30 @@ void ApplyNaviShadowLightFix() {
 void PreventNaviShadowCaster(void* actorPointer) {
     PlayState* play = gPlayState;
     Actor* actor = static_cast<Actor*>(actorPointer);
-    if (play == nullptr || actor == nullptr || actor->id != ACTOR_EN_ELF || actor->params != FAIRY_NAVI ||
+    if (play == nullptr || play->state.gfxCtx == nullptr || actor == nullptr || actor->id != ACTOR_EN_ELF ||
+        actor->params != FAIRY_NAVI ||
         CVarGetInteger(CVAR_ENHANCEMENT("Graphics.WorldShadows.Enabled"), 0) == 0) {
         return;
     }
 
-    // ToonLighting.cpp may arm the generic actor caster before this later hook executes. Write the disarm
-    // commands directly into both display buffers. Avoid OPEN_DISPS/CLOSE_DISPS here because their block-local
-    // frame-interpolation declarations acquire C++ linkage in this translation unit on MSVC.
+    // HandleActorDraw may have armed the generic opaque caster before this later hook executes. Navi is
+    // predominantly translucent, so leaving that state armed can leak into the next opaque actor. Close
+    // both streams explicitly before any fairy core, glow card, or particle geometry is submitted.
     GraphicsContext* graphicsContext = play->state.gfxCtx;
     gSPToonShadow(graphicsContext->polyOpa.p++, 0, 0, 0, 0.0f);
     gSPToonShadow(graphicsContext->polyXlu.p++, 0, 0, 0, 0.0f);
 }
 
-void RegisterNaviShadowLightFix() {
-    COND_HOOK(OnGameFrameUpdate, true, ApplyNaviShadowLightFix);
+void RegisterNaviShadowFix() {
+    COND_HOOK(OnGameFrameUpdate, true, ApplyNaviShadowPolicy);
     COND_HOOK(OnActorDraw, true, PreventNaviShadowCaster);
 }
 
 } // namespace
 
-// The Z-prefixed filename sorts after ToonLighting.cpp in CMake's recursive glob, so these hooks are
-// registered afterwards and intentionally become the final shadow-light policy for each frame/actor draw.
-static RegisterShipInitFunc initNaviShadowLightFix(
-    RegisterNaviShadowLightFix,
+// The Z-prefixed filename sorts after ToonLighting.cpp in CMake's recursive glob, making these hooks
+// the final world-shadow policy for each frame and the final caster policy for Navi's actor draw.
+static RegisterShipInitFunc initNaviShadowFix(
+    RegisterNaviShadowFix,
     { CVAR_ENHANCEMENT("Graphics.ToonLighting.UseNaviLight"),
       CVAR_ENHANCEMENT("Graphics.WorldShadows.Enabled") });
