@@ -60,9 +60,9 @@ static constexpr float kDefaultShadowOpacity = 0.2f;
 static constexpr float kDefaultShadowLength = 0.2f;
 static constexpr float kDefaultShadowSlabDepth = 8.0f; // stencil-volume depth below the feet (ground band)
 static constexpr float kDefaultShadowSlabRise = 8.0f;  // stencil-volume height above the feet (uphill ground)
-static constexpr int kDefaultShadowEdgeSoftness = 0;  // penumbra rings around the silhouette (0 = hard edge)
-static constexpr int kDefaultShadowMaxDistance = 550; // camera-forward distance past which shadows are culled
-static constexpr float kShadowFadeTime = 0.15f; // seconds to ease the shadow size in/out (anti-pop, like Navi)
+static constexpr int kDefaultShadowEdgeSoftness = 0;   // penumbra rings around the silhouette (0 = hard edge)
+static constexpr int kDefaultShadowMaxDistance = 550;  // camera-forward distance past which shadows are culled
+static constexpr float kShadowFadeTime = 0.15f;        // seconds to ease the shadow size in/out (anti-pop, like Navi)
 
 // Per-frame snapshot of every CVar the per-actor hot path reads. CVarGet* is a string-keyed hash-map
 // lookup that heap-allocates for keys this long, and HandleActorDraw runs for EVERY drawn actor every
@@ -83,11 +83,11 @@ static struct {
 static void RefreshFrameParams() {
     sParams.cel = CVarGetInteger(CVAR_ENHANCEMENT("Graphics.ToonLighting.Enabled"), 1) != 0;
     sParams.shadows = CVarGetInteger(CVAR_ENHANCEMENT("Graphics.WorldShadows.Enabled"), 0) != 0;
-    sParams.suppressVanilla =
-        CVarGetInteger(CVAR_ENHANCEMENT("Graphics.WorldShadows.SuppressVanillaShadows"), 1) != 0;
+    sParams.suppressVanilla = CVarGetInteger(CVAR_ENHANCEMENT("Graphics.WorldShadows.SuppressVanillaShadows"), 1) != 0;
     sParams.useNaviLight = CVarGetInteger(CVAR_ENHANCEMENT("Graphics.ToonLighting.UseNaviLight"), 1) != 0;
     sParams.showDebug = CVarGetInteger(CVAR_DEVELOPER_TOOLS("ToonLighting.ShowDebug"), 0) != 0;
-    sParams.pointRange = CVarGetFloat(CVAR_ENHANCEMENT("Graphics.ToonLighting.PointLightRange"), kDefaultPointLightRange);
+    sParams.pointRange =
+        CVarGetFloat(CVAR_ENHANCEMENT("Graphics.ToonLighting.PointLightRange"), kDefaultPointLightRange);
     sParams.transitionTime =
         CVarGetFloat(CVAR_ENHANCEMENT("Graphics.ToonLighting.TransitionTime"), kDefaultTransitionTime);
     sParams.maxDist =
@@ -132,10 +132,10 @@ static bool ToonActorExcluded(Actor* actor) {
         case ACTOR_BG_TREEMOUTH:  // Great Deku Tree (very tall)
         case ACTOR_BG_MIZU_WATER: // water-box surfaces
         case ACTOR_BG_HAKA_WATER:
-        case ACTOR_EN_WOOD02:     // trees / bushes / leaf scenery
-        case ACTOR_OBJ_SWITCH:    // floor/crystal/eye switches — environment fixtures, not relit objects.
-        case ACTOR_OBJ_BEAN:      // magic bean plant/platform — same. Both are also RECEIVERS below, so
-                                  // they still catch other actors' shadows like the ground does.
+        case ACTOR_EN_WOOD02:  // trees / bushes / leaf scenery
+        case ACTOR_OBJ_SWITCH: // floor/crystal/eye switches — environment fixtures, not relit objects.
+        case ACTOR_OBJ_BEAN:   // magic bean plant/platform — same. Both are also RECEIVERS below, so
+                               // they still catch other actors' shadows like the ground does.
             return true;
         default:
             break;
@@ -185,6 +185,7 @@ static bool ToonShadowReceiver(Actor* actor) {
                                        // during motion — the test case for whether moving receivers look OK.
         case ACTOR_OBJ_SWITCH:         // floor switches are stood on (SWITCH category — see the pre-pass note)
         case ACTOR_OBJ_BEAN:           // the bean platform is ridden; excluded from relight too (above)
+        case ACTOR_EN_WOOD02: // trees/bushes: draw before the flush so trunks and opaque foliage receive shadows
             return true;
         case ACTOR_BG_HAKA_GATE: {
             // Shadow Temple. One overlay drives four different things; the variant is the low byte of params
@@ -262,7 +263,7 @@ static bool sHaveLastKey = false;
 static s8 sLastKeyDir[3];
 static u8 sLastKeyCol[3];
 
-static void ToonClearKeyStates(); // defined with the key-state map below
+static void ToonClearKeyStates();                                      // defined with the key-state map below
 static void ToonEnvKey(PlayState* play, f32 dirOut[3], f32 colOut[3]); // stable world-shadow light
 
 // Runs once per frame (game-frame-update hook, after the frame's draw). Pushes the frame-global ramp
@@ -275,12 +276,15 @@ static void OnToonFrameUpdate() {
     RefreshFrameParams();
 
     // Dynamic shadow mapping uses one stable directional light and one stable world-space anchor.
+    // Navi contributes a local fill light: it does not render an expensive six-face point-shadow map,
+    // but it lifts the directional shadow around the fairy using her real world position.
     // Do this before the early-out so disabling shadows immediately stops environment capture and
     // clears any previous-frame caster data in the renderer.
     if (auto interp = GetInterpreter()) {
         f32 shadowDir[3] = { 0.30f, 1.0f, 0.20f };
         f32 shadowColor[3] = { 1.0f, 1.0f, 1.0f };
         f32 shadowAnchor[3] = { 0.0f, 0.0f, 0.0f };
+        f32 localShadowLight[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
         if (gPlayState != NULL) {
             ToonEnvKey(gPlayState, shadowDir, shadowColor);
             Player* player = GET_PLAYER(gPlayState);
@@ -288,9 +292,18 @@ static void OnToonFrameUpdate() {
                 shadowAnchor[0] = player->actor.world.pos.x;
                 shadowAnchor[1] = player->actor.world.pos.y;
                 shadowAnchor[2] = player->actor.world.pos.z;
+
+                Actor* naviActor = player->naviActor;
+                if (sParams.useNaviLight && naviActor != NULL && naviActor->id == ACTOR_EN_ELF &&
+                    naviActor->params == FAIRY_NAVI) {
+                    localShadowLight[0] = naviActor->world.pos.x;
+                    localShadowLight[1] = naviActor->world.pos.y;
+                    localShadowLight[2] = naviActor->world.pos.z;
+                    localShadowLight[3] = 320.0f;
+                }
             }
         }
-        interp->SetDynamicShadowCaptureState(sParams.shadows, shadowDir, shadowAnchor);
+        interp->SetDynamicShadowCaptureState(sParams.shadows, shadowDir, shadowAnchor, localShadowLight);
     }
 
     // Clear before any early-out, so the dedup state resets even on a headless window (no renderer).
@@ -351,13 +364,11 @@ static void OnToonFrameUpdate() {
     // black (shadow) so it is obvious which draws receive toon lighting (e.g. confirming whether large
     // water/lava surfaces are being relit and causing the ramp edge to flicker across them).
     f32 debugBands = CVarGetInteger(CVAR_DEVELOPER_TOOLS("ToonLighting.HighlightBands"), 0) ? 1.0f : 0.0f;
-    rapi->SetToonRamp(CVarGetFloat(CVAR_ENHANCEMENT("Graphics.ToonLighting.RampCenter"), kDefaultRampCenter),
-                      CVarGetFloat(CVAR_ENHANCEMENT("Graphics.ToonLighting.RampSoftness"), kDefaultRampSoftness),
-                      CVarGetFloat(CVAR_ENHANCEMENT("Graphics.ToonLighting.HighlightIntensity"),
-                                   kDefaultHighlightIntensity),
-                      CVarGetFloat(CVAR_ENHANCEMENT("Graphics.ToonLighting.ShadowIntensity"),
-                                   kDefaultShadowIntensity),
-                      debugBands);
+    rapi->SetToonRamp(
+        CVarGetFloat(CVAR_ENHANCEMENT("Graphics.ToonLighting.RampCenter"), kDefaultRampCenter),
+        CVarGetFloat(CVAR_ENHANCEMENT("Graphics.ToonLighting.RampSoftness"), kDefaultRampSoftness),
+        CVarGetFloat(CVAR_ENHANCEMENT("Graphics.ToonLighting.HighlightIntensity"), kDefaultHighlightIntensity),
+        CVarGetFloat(CVAR_ENHANCEMENT("Graphics.ToonLighting.ShadowIntensity"), kDefaultShadowIntensity), debugBands);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -532,10 +543,8 @@ static void ToonEnvKey(PlayState* play, f32 dirOut[3], f32 colOut[3]) {
 // ray" pointing from an actor toward a light.
 static Vtx sToonRayVtx[5] = {
     VTX(-1, 0, -1, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF), // base
-    VTX(1, 0, -1, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF),
-    VTX(1, 0, 1, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF),
-    VTX(-1, 0, 1, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF),
-    VTX(0, 1, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF), // tip
+    VTX(1, 0, -1, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF),  VTX(1, 0, 1, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF),
+    VTX(-1, 0, 1, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF),  VTX(0, 1, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF), // tip
 };
 
 static Gfx sToonRayDL[] = {
@@ -592,8 +601,7 @@ static void DrawDebugRay(PlayState* play, Vec3f* base, f32 dir[3], u8 r, u8 g, u
 
     gDPPipeSync(POLY_XLU_DISP++);
     gSPClearGeometryMode(POLY_XLU_DISP++, G_LIGHTING | G_CULL_BACK | G_CULL_FRONT);
-    gDPSetCombineLERP(POLY_XLU_DISP++, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE, 0, 0, 0,
-                      PRIMITIVE);
+    gDPSetCombineLERP(POLY_XLU_DISP++, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE);
     gDPSetRenderMode(POLY_XLU_DISP++, G_RM_AA_XLU_SURF, G_RM_AA_XLU_SURF2);
     gDPSetPrimColor(POLY_XLU_DISP++, 0, 0, r, g, b, 200);
 
@@ -624,8 +632,7 @@ static void DrawDebugRing(PlayState* play, Vec3f* center, f32 radius, u8 r, u8 g
 
     gDPPipeSync(POLY_XLU_DISP++);
     gSPClearGeometryMode(POLY_XLU_DISP++, G_LIGHTING | G_CULL_BACK | G_CULL_FRONT);
-    gDPSetCombineLERP(POLY_XLU_DISP++, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE, 0, 0, 0,
-                      PRIMITIVE);
+    gDPSetCombineLERP(POLY_XLU_DISP++, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE, 0, 0, 0, PRIMITIVE);
     gDPSetRenderMode(POLY_XLU_DISP++, G_RM_AA_XLU_SURF, G_RM_AA_XLU_SURF2);
     gDPSetPrimColor(POLY_XLU_DISP++, 0, 0, r, g, b, a);
 
@@ -683,8 +690,9 @@ static void DrawDebugOverlay(PlayState* play, Actor* actor, f32 pointRange, f32 
                 f32 dist = sqrtf(dsq);
                 f32 scale = 1.0f - ((dist / radius) * (dist / radius));
                 f32 att = 0.5f + (0.5f * scale); // distance falloff, just for the visual length
-                f32 plum = ((info->params.point.color[0] + info->params.point.color[1] +
-                             info->params.point.color[2]) / (3.0f * 255.0f)) * att;
+                f32 plum = ((info->params.point.color[0] + info->params.point.color[1] + info->params.point.color[2]) /
+                            (3.0f * 255.0f)) *
+                           att;
 
                 if (dist > 0.001f) {
                     cdir[0] = dx / dist, cdir[1] = dy / dist, cdir[2] = dz / dist;
