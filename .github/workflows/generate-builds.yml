@@ -2,9 +2,12 @@ name: Windows manual build
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - wind-waker-style-cel-shading
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -195,3 +198,19 @@ jobs:
         with:
           key: ${{ steps.restore-cache-vcpkg.outputs.cache-primary-key }}
           path: vcpkg
+
+  cleanup-trigger:
+    name: Remove temporary build branch
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs:
+      - generate-soh-otr
+      - build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete temporary branch
+        shell: bash
+        run: |
+          git init cleanup
+          cd cleanup
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git push origin --delete "${{ github.head_ref }}" || true
