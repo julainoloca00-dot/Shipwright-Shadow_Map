@@ -180,6 +180,7 @@ static f32 sDynamicNaviInfluence = 0.0f;
           git commit -m "Fix Navi point-light shadow direction"
           git push origin HEAD:wind-waker-style-cel-shading
           git push origin --delete temp-navi-light-fix || true
+          git push origin --delete temp-navi-light-fix-v2 || true
 
       - name: Start corrected Windows build
         env:
