@@ -807,10 +807,15 @@ static void HandleActorDraw(void* actorPtr) {
         }
         bool hasFloor = false;
         f32 floorHeight = actor->floorHeight;
-        // The lower bound matters with the extended-culling enhancements: they draw actors BEHIND the
-        // camera (negative projected z), which would otherwise pay full capture + volume cost for a
-        // shadow that is never visible.
-        if (!ToonShadowExcluded(actor) && actor->projectedPos.z < maxDist && actor->projectedPos.z > -100.0f) {
+        // Frustum culling for shadow casters: use the engine's real camera-volume result instead of
+        // relying only on projected Z. Extended draw-distance options may still submit off-screen actors,
+        // but they no longer pay geometry capture, shadow-map rasterization, or PCF resolve coverage.
+        // The player is kept as a safe exception because first-person/cutscene camera modes can briefly
+        // update the actor culling flag after the player draw decision.
+        const bool shadowCasterInCameraFrustum =
+            actor->id == ACTOR_PLAYER || (actor->flags & ACTOR_FLAG_INSIDE_CULLING_VOLUME) != 0;
+        if (!ToonShadowExcluded(actor) && shadowCasterInCameraFrustum && actor->projectedPos.z < maxDist &&
+            actor->projectedPos.z > -100.0f) {
             // Floor reference is the gate + a "near the ground" sanity check, and the feet-clamp Y for
             // deep-rooted actors (the renderer otherwise builds the volume from the captured feet, not this
             // plane). Most actors expose actor->floorPoly from their bg check; a few (e.g. the Courtyard Guards,
