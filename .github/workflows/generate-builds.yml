@@ -111,7 +111,9 @@ jobs:
 
       - name: Apply realistic shadow fixes
         shell: pwsh
-        run: python scripts/apply_realistic_shadow_fixes.py
+        run: |
+          python scripts/apply_realistic_shadow_fixes.py
+          python scripts/refine_realistic_shadow_fixes.py
 
       - name: Configure sccache
         uses: hendrikmuhs/ccache-action@v1.2
