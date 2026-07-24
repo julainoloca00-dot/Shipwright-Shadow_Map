@@ -1,0 +1,177 @@
+name: Apply Navi light direction fix
+
+on:
+  pull_request:
+    branches:
+      - wind-waker-style-cel-shading
+    paths:
+      - .navi-light-direction-trigger
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: wind-waker-style-cel-shading
+          fetch-depth: 0
+
+      - name: Correct Navi shadow direction and illumination
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('soh/soh/Enhancements/Graphics/ToonLighting.cpp')
+          text = path.read_text(encoding='utf-8')
+
+          old = '''// Navi's two emitted lights, resolved once per frame when the player opted her out of key selection
+// (identical for every actor; see ToonClosestPointLight). Compared by address only, never dereferenced.
+static LightInfo* sNaviGlow = NULL;
+static LightInfo* sNaviNoGlow = NULL;
+'''
+          new = '''// Navi's two emitted lights, resolved once per frame when the player opted her out of key selection
+// (identical for every actor; see ToonClosestPointLight). Compared by address only, never dereferenced.
+static LightInfo* sNaviGlow = NULL;
+static LightInfo* sNaviNoGlow = NULL;
+// Frame-global contribution of Navi to the dynamic shadow key. This also attenuates the remaining
+// environment shadow uniformly, avoiding the artificial dark/bright ring produced by a radial mask.
+static f32 sDynamicNaviInfluence = 0.0f;
+'''
+          if text.count(old) != 1:
+              raise SystemExit('Navi static state block not found exactly once')
+          text = text.replace(old, new, 1)
+
+          old = '''    // Dynamic shadow mapping uses one stable directional light and one stable world-space anchor.
+    // Navi contributes a local fill light: it does not render an expensive six-face point-shadow map,
+    // but it lifts the directional shadow around the fairy using her real world position.
+    // Do this before the early-out so disabling shadows immediately stops environment capture and
+    // clears any previous-frame caster data in the renderer.
+    if (auto interp = GetInterpreter()) {
+        f32 shadowDir[3] = { 0.30f, 1.0f, 0.20f };
+        f32 shadowColor[3] = { 1.0f, 1.0f, 1.0f };
+        f32 shadowAnchor[3] = { 0.0f, 0.0f, 0.0f };
+        f32 localShadowLight[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        if (gPlayState != NULL) {
+            ToonEnvKey(gPlayState, shadowDir, shadowColor);
+            Player* player = GET_PLAYER(gPlayState);
+            if (player != NULL) {
+                shadowAnchor[0] = player->actor.world.pos.x;
+                shadowAnchor[1] = player->actor.world.pos.y;
+                shadowAnchor[2] = player->actor.world.pos.z;
+
+                Actor* naviActor = player->naviActor;
+                if (sParams.useNaviLight && naviActor != NULL && naviActor->id == ACTOR_EN_ELF &&
+                    naviActor->params == FAIRY_NAVI) {
+                    localShadowLight[0] = naviActor->world.pos.x;
+                    localShadowLight[1] = naviActor->world.pos.y;
+                    localShadowLight[2] = naviActor->world.pos.z;
+                    localShadowLight[3] = 320.0f;
+                }
+            }
+        }
+        interp->SetDynamicShadowCaptureState(sParams.shadows, shadowDir, shadowAnchor, localShadowLight);
+    }
+'''
+          new = '''    // Dynamic shadow mapping uses a direction FROM the receiver TOWARD the light. Navi is a point
+    // light, so her physically correct vector at Link is Link -> Navi. The old code supplied Navi -> Link,
+    // reversing the projection and making the fairy appear to emit darkness. Blend her point-light vector
+    // into the environment key, strongest in dark scenes. The backend radial fill is deliberately disabled:
+    // it produced a visible circular halo rather than real directional illumination.
+    sDynamicNaviInfluence = 0.0f;
+    if (auto interp = GetInterpreter()) {
+        f32 shadowDir[3] = { 0.30f, 1.0f, 0.20f };
+        f32 shadowColor[3] = { 1.0f, 1.0f, 1.0f };
+        f32 shadowAnchor[3] = { 0.0f, 0.0f, 0.0f };
+        f32 disabledRadialLight[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        if (gPlayState != NULL) {
+            ToonEnvKey(gPlayState, shadowDir, shadowColor);
+            Player* player = GET_PLAYER(gPlayState);
+            if (player != NULL) {
+                shadowAnchor[0] = player->actor.world.pos.x;
+                shadowAnchor[1] = player->actor.world.pos.y;
+                shadowAnchor[2] = player->actor.world.pos.z;
+
+                Actor* naviActor = player->naviActor;
+                if (sParams.useNaviLight && naviActor != NULL && naviActor->id == ACTOR_EN_ELF &&
+                    naviActor->params == FAIRY_NAVI) {
+                    f32 naviDir[3] = {
+                        naviActor->world.pos.x - shadowAnchor[0],
+                        naviActor->world.pos.y - shadowAnchor[1],
+                        naviActor->world.pos.z - shadowAnchor[2],
+                    };
+                    f32 naviLen = sqrtf((naviDir[0] * naviDir[0]) + (naviDir[1] * naviDir[1]) +
+                                        (naviDir[2] * naviDir[2]));
+                    if (naviLen > 0.001f) {
+                        naviDir[0] /= naviLen;
+                        naviDir[1] /= naviLen;
+                        naviDir[2] /= naviLen;
+
+                        f32 envLum = CLAMP((shadowColor[0] + shadowColor[1] + shadowColor[2]) / 3.0f, 0.0f, 1.0f);
+                        f32 darkness = 1.0f - envLum;
+                        f32 naviWeight = 0.10f + (darkness * 0.80f);
+                        f32 blended[3] = {
+                            shadowDir[0] + ((naviDir[0] - shadowDir[0]) * naviWeight),
+                            shadowDir[1] + ((naviDir[1] - shadowDir[1]) * naviWeight),
+                            shadowDir[2] + ((naviDir[2] - shadowDir[2]) * naviWeight),
+                        };
+                        f32 blendedLen = sqrtf((blended[0] * blended[0]) + (blended[1] * blended[1]) +
+                                               (blended[2] * blended[2]));
+                        if (blendedLen > 0.001f) {
+                            shadowDir[0] = blended[0] / blendedLen;
+                            shadowDir[1] = blended[1] / blendedLen;
+                            shadowDir[2] = blended[2] / blendedLen;
+                            sDynamicNaviInfluence = naviWeight;
+                        }
+                    }
+                }
+            }
+        }
+        interp->SetDynamicShadowCaptureState(sParams.shadows, shadowDir, shadowAnchor, disabledRadialLight);
+    }
+'''
+          if text.count(old) != 1:
+              raise SystemExit('old dynamic Navi shadow block not found exactly once')
+          text = text.replace(old, new, 1)
+
+          old = '''        f32 opacity = CVarGetFloat(CVAR_ENHANCEMENT("Graphics.WorldShadows.Opacity"), kDefaultShadowOpacity);
+'''
+          new = '''        f32 opacity = CVarGetFloat(CVAR_ENHANCEMENT("Graphics.WorldShadows.Opacity"), kDefaultShadowOpacity);
+        // A bright nearby point light both redirects and weakens the environment shadow. This attenuation is
+        // uniform for the player-centred shadow key, so no circular boundary or inverted "Navi shadow" appears.
+        opacity *= 1.0f - (0.55f * sDynamicNaviInfluence);
+'''
+          if text.count(old) != 1:
+              raise SystemExit('shadow opacity line not found exactly once')
+          text = text.replace(old, new, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Commit fix and remove temporary workflow
+        shell: bash
+        run: |
+          rm -f .github/workflows/apply-navi-light-direction-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add soh/soh/Enhancements/Graphics/ToonLighting.cpp .github/workflows/apply-navi-light-direction-fix.yml
+          git commit -m "Fix Navi point-light shadow direction"
+          git push origin HEAD:wind-waker-style-cel-shading
+          git push origin --delete temp-navi-light-fix || true
+
+      - name: Start corrected Windows build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          curl --fail-with-body -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/generate-builds.yml/dispatches \
+            -d '{"ref":"wind-waker-style-cel-shading"}'
