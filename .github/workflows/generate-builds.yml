@@ -1,33 +1,186 @@
 name: Windows manual build
 
 on:
+  workflow_dispatch:
   pull_request:
     branches:
       - wind-waker-style-cel-shading
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  apply-world-shadow-integration:
-    if: github.actor != 'github-actions[bot]'
-    runs-on: ubuntu-latest
+  generate-soh-otr:
+    name: Generate soh.o2r
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Git Checkout
+        uses: actions/checkout@v6
         with:
-          ref: ${{ github.head_ref }}
-          submodules: recursive
-          fetch-depth: 0
-      - name: Pin validated libultraship shadow backend
+          submodules: true
+
+      - name: Configure ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          save: ${{ github.ref_name == github.event.repository.default_branch }}
+          key: ${{ runner.os }}-otr-ccache-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-otr-ccache-${{ github.ref }}
+            ${{ runner.os }}-otr-ccache
+
+      - name: Install dependencies
         run: |
-          git -C libultraship fetch origin agent/fix-shadow-camera-stability-pr
-          git -C libultraship checkout 7250eae07949590367075fe52a2fec87a18343a2
-      - name: Apply game integration
-        run: python tools/apply_world_shadow_integration.py
-      - name: Commit integration
+          sudo apt-get update
+          sudo apt-get install -y $(cat .github/workflows/apt-deps.txt) libzip-dev zipcmp zipmerge ziptool
+
+      - name: Restore Cached deps folder
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ runner.os }}-deps-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-deps-${{ github.ref }}-
+            ${{ runner.os }}-deps-
+          path: deps
+
+      - name: Create deps folder
+        run: mkdir -p deps
+
+      - name: Install latest SDL
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add libultraship soh/soh/Enhancements/Graphics/ToonLighting.cpp
-          git commit -m "Integrate stable environment shadow mapping"
-          git push origin HEAD:${{ github.head_ref }}
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          if [ ! -d "deps/SDL2-2.30.3" ]; then
+            wget https://github.com/libsdl-org/SDL/releases/download/release-2.30.3/SDL2-2.30.3.tar.gz
+            tar -xzf SDL2-2.30.3.tar.gz -C deps
+          fi
+          cd deps/SDL2-2.30.3
+          ./configure --enable-hidapi-libusb
+          make -j 10
+          sudo make install
+          sudo cp -av /usr/local/lib/libSDL* /lib/x86_64-linux-gnu/
+
+      - name: Install latest tinyxml2
+        run: |
+          sudo apt-get remove -y libtinyxml2-dev || true
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          if [ ! -d "deps/tinyxml2-10.0.0" ]; then
+            wget https://github.com/leethomason/tinyxml2/archive/refs/tags/10.0.0.tar.gz
+            tar -xzf 10.0.0.tar.gz -C deps
+          fi
+          cd deps/tinyxml2-10.0.0
+          mkdir -p build
+          cd build
+          cmake ..
+          make -j 3
+          sudo make install
+
+      - name: Generate soh.o2r
+        run: |
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          cmake --no-warn-unused-cli -H. -Bbuild-cmake -GNinja -DCMAKE_BUILD_TYPE:STRING=Release
+          cmake --build build-cmake --config Release --target GenerateSohOtr -j3
+
+      - name: Upload soh.o2r
+        uses: actions/upload-artifact@v7
+        with:
+          name: soh.o2r
+          path: soh.o2r
+          if-no-files-found: error
+          retention-days: 3
+
+  build-windows:
+    name: Build Windows x64
+    needs: generate-soh-otr
+    runs-on: windows-latest
+    steps:
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          choco install ninja -y
+          Remove-Item -Path "C:\ProgramData\Chocolatey\bin\ccache.exe" -Force -ErrorAction SilentlyContinue
+
+      - name: Git Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Configure sccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          variant: sccache
+          max-size: "2G"
+          evict-old-files: job
+          save: ${{ github.ref_name == github.event.repository.default_branch }}
+          key: ${{ runner.os }}-ccache-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-${{ github.ref }}
+            ${{ runner.os }}-ccache
+
+      - name: Restore Cached VCPKG folder
+        id: restore-cache-vcpkg
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ runner.os }}-vcpkg-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-${{ github.ref }}-
+            ${{ runner.os }}-vcpkg-
+          path: vcpkg
+
+      - name: Configure Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Download soh.o2r
+        uses: actions/download-artifact@v7
+        with:
+          name: soh.o2r
+          path: build-windows/soh
+
+      - name: Build SoH
+        shell: pwsh
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          $env:PATH = "$env:USERPROFILE/.cargo/bin;$env:PATH"
+
+          cmake -S . -B build-windows -G Ninja `
+            -DCMAKE_MAKE_PROGRAM=ninja `
+            -DCMAKE_BUILD_TYPE:STRING=Release `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DBUILD_REMOTE_CONTROL=1
+
+          cmake --build build-windows --config Release --parallel 10
+          Push-Location build-windows
+          cpack
+          Pop-Location
+
+          $zip = @(
+            Get-ChildItem -Path "_packages" -Filter "*.zip" -File -ErrorAction SilentlyContinue
+            Get-ChildItem -Path "build-windows/_packages" -Filter "*.zip" -File -ErrorAction SilentlyContinue
+          ) | Select-Object -First 1
+
+          if (-not $zip) {
+            throw "CPack não gerou o pacote ZIP do Windows."
+          }
+
+          New-Item -ItemType Directory -Path "_packages" -Force | Out-Null
+          Copy-Item $zip.FullName "_packages/soh-windows.zip" -Force
+          Expand-Archive -Path "_packages/soh-windows.zip" -DestinationPath "soh-windows" -Force
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v7
+        with:
+          name: soh-windows
+          path: soh-windows
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Save Cache VCPKG folder
+        if: ${{ github.ref_name == github.event.repository.default_branch }}
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.restore-cache-vcpkg.outputs.cache-primary-key }}
+          path: vcpkg
