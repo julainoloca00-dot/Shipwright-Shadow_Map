@@ -786,18 +786,15 @@ static void HandleActorDraw(void* actorPtr) {
         }
     }
 
-    // Actor shadow: arm this actor's drop shadow. The renderer builds a stencil volume from the actor's
-    // captured silhouette and casts it along the key just snapshotted (gSPToonKey above) onto the real ground,
-    // so it conforms to slopes and always agrees with the cel shading. POLY_OPA only, so translucent effects
-    // don't cast. Emitted for every non-excluded actor when on (zero normal disarms it) so the per-object
-    // boundary is always marked and the previous actor's capture can't leak into this one.
+    // Actor shadow: arm this actor as a dynamic shadow-map caster. The renderer captures the actor's
+    // opaque world-space triangles and rasterizes them into the shared low-resolution directional depth map.
+    // Translucent effects do not cast. Emitting a zero normal disarms capture and keeps actor boundaries strict.
     if (shadowsEnabled) {
         // The shadow shows when the actor is on/near the ground, within the render-distance cull, and NOT on a
         // wall — climbing a ladder/vine or climbing/hanging off a ledge, where it's flat against a vertical
-        // surface and the ground shadow's slab would cut into the wall and leave broken lines. Rather than pop
-        // on/off, the SIZE eases 0..1 (like Navi's light) so it grows in / shrinks to nothing. The eased scale
-        // rides in planeD; the renderer scales the footprint by it (it ignores the floor plane otherwise), and
-        // any nonzero normal simply arms the pass. A zero normal fully disarms it (no capture/projection/draw).
+        // surface and a projected ground shadow would cut into the wall. The existing eased state is retained
+        // for compatibility with the arming logic; any nonzero normal enables caster capture, while a zero
+        // normal fully disarms it.
         f32 maxDist = sParams.maxDist;
         bool onWall = false;
         if (actor->id == ACTOR_PLAYER) {
