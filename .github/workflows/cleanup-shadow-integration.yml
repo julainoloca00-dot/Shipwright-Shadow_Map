@@ -1,0 +1,70 @@
+name: Final shadow integration cleanup
+
+on:
+  pull_request:
+    branches:
+      - wind-waker-style-cel-shading
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cleanup-shadow-${{ github.event.pull_request.head.ref }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout implementation branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/dynamic-shadow-map-pcf
+          fetch-depth: 0
+
+      - name: Remove build artifact and refresh comments
+        run: |
+          set -euo pipefail
+          git rm -f vcpkg
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('soh/soh/Enhancements/Graphics/ToonLighting.cpp')
+          text = path.read_text(encoding='utf-8')
+          old = '''    // Actor shadow: arm this actor's drop shadow. The renderer builds a stencil volume from the actor's
+              // captured silhouette and casts it along the key just snapshotted (gSPToonKey above) onto the real ground,
+              // so it conforms to slopes and always agrees with the cel shading. POLY_OPA only, so translucent effects
+              // don't cast. Emitted for every non-excluded actor when on (zero normal disarms it) so the per-object
+              // boundary is always marked and the previous actor's capture can't leak into this one.
+          '''
+          new = '''    // Actor shadow: arm this actor as a dynamic shadow-map caster. The renderer captures the actor's
+              // opaque world-space triangles and rasterizes them into the shared low-resolution directional depth map.
+              // Translucent effects do not cast. Emitting a zero normal disarms capture and keeps actor boundaries strict.
+          '''
+          if text.count(old) != 1:
+              raise RuntimeError(f'Expected one actor-shadow comment block, found {text.count(old)}')
+          text = text.replace(old, new, 1)
+          text = text.replace(
+              '        // surface and the ground shadow\'s slab would cut into the wall and leave broken lines. Rather than pop\n'
+              '        // on/off, the SIZE eases 0..1 (like Navi\'s light) so it grows in / shrinks to nothing. The eased scale\n'
+              '        // rides in planeD; the renderer scales the footprint by it (it ignores the floor plane otherwise), and\n'
+              '        // any nonzero normal simply arms the pass. A zero normal fully disarms it (no capture/projection/draw).\n',
+              '        // surface and a projected ground shadow would cut into the wall. The existing eased state is retained\n'
+              '        // for compatibility with the arming logic; any nonzero normal enables caster capture, while a zero\n'
+              '        // normal fully disarms it.\n',
+              1,
+          )
+          path.write_text(text, encoding='utf-8')
+          PY
+          rm .github/workflows/cleanup-shadow-integration.yml
+          git diff --check
+
+      - name: Commit clean integration
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "Remove build artifact and refresh shadow-map comments"
+          git push origin HEAD:agent/dynamic-shadow-map-pcf
