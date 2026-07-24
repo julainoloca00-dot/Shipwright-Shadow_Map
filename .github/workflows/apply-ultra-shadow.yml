@@ -1,13 +1,14 @@
 name: apply-ultra-shadow
 
 on:
-  push:
+  pull_request:
     branches:
       - wind-waker-style-cel-shading
 
 permissions:
   contents: write
   actions: write
+  pull-requests: write
 
 jobs:
   apply:
@@ -116,7 +117,9 @@ jobs:
           git commit -m 'Apply ultra-definition shadow threshold and Navi fill'
           git push origin HEAD:wind-waker-style-cel-shading
 
-      - name: Start Windows package build
+      - name: Start Windows package build and clean trigger PR
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run generate-builds.yml --ref wind-waker-style-cel-shading
+        run: |
+          gh workflow run generate-builds.yml --ref wind-waker-style-cel-shading
+          gh pr close '${{ github.event.pull_request.number }}' --delete-branch --comment 'Aplicação concluída diretamente na celshade; build Windows disparado.'
