@@ -19,7 +19,6 @@
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "soh/ShipInit.hpp"
 #include "soh/cvar_prefixes.h"
-#include "soh/frame_interpolation.h"
 
 extern "C" {
 #include "functions.h"
@@ -161,13 +160,12 @@ void PreventNaviShadowCaster(void* actorPointer) {
         return;
     }
 
-    // ToonLighting.cpp may arm the generic actor caster before this later hook executes. Close both streams
-    // again before En_Elf submits any geometry: the fairy core, glow cards, and translucent particles must
-    // illuminate the scene but must never become occluders in the directional depth map.
-    OPEN_DISPS(play->state.gfxCtx);
-    gSPToonShadow(POLY_OPA_DISP++, 0, 0, 0, 0.0f);
-    gSPToonShadow(POLY_XLU_DISP++, 0, 0, 0, 0.0f);
-    CLOSE_DISPS(play->state.gfxCtx);
+    // ToonLighting.cpp may arm the generic actor caster before this later hook executes. Write the disarm
+    // commands directly into both display buffers. Avoid OPEN_DISPS/CLOSE_DISPS here because their block-local
+    // frame-interpolation declarations acquire C++ linkage in this translation unit on MSVC.
+    GraphicsContext* graphicsContext = play->state.gfxCtx;
+    gSPToonShadow(graphicsContext->polyOpa.p++, 0, 0, 0, 0.0f);
+    gSPToonShadow(graphicsContext->polyXlu.p++, 0, 0, 0, 0.0f);
 }
 
 void RegisterNaviShadowLightFix() {
