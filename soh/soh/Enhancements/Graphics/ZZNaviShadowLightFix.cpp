@@ -1,4 +1,5 @@
 // Corrective world-shadow light policy for Navi.
+// Revision: receiver-to-light direction, no radial shadow halo.
 //
 // ToonLighting.cpp originally forwards Navi as a radial shadow-opacity mask. That creates a circular
 // light/dark boundary and can visually resemble a shadow emitted by the fairy. This module runs after
