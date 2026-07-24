@@ -104,6 +104,20 @@ jobs:
         with:
           submodules: true
 
+      - name: Enable tree foliage shadow capture
+        shell: pwsh
+        run: |
+          $path = "libultraship/src/fast/interpreter.cpp"
+          $text = Get-Content -Path $path -Raw
+          $old = "if (mRdp->toon_shadow && !is_rect && (mRsp->geometry_mode & G_LIGHTING)) {"
+          $new = "if (mRdp->toon_shadow && !is_rect) {"
+          $count = ([regex]::Matches($text, [regex]::Escape($old))).Count
+          if ($count -ne 1) {
+            throw "Expected exactly one actor-shadow lighting gate, found $count."
+          }
+          $text = $text.Replace($old, $new)
+          Set-Content -Path $path -Value $text -Encoding utf8NoBOM -NoNewline
+
       - name: Configure sccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
