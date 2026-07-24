@@ -1,7 +1,9 @@
 name: Windows manual build
 
 on:
-  workflow_dispatch:
+  pull_request:
+    branches:
+      - wind-waker-style-cel-shading
 
 permissions:
   contents: read
