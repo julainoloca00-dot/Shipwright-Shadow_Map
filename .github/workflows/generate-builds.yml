@@ -2,9 +2,14 @@ name: Windows manual build
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches:
+      - wind-waker-style-cel-shading
+    paths:
+      - .realistic-shadow-build-trigger
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -104,19 +109,9 @@ jobs:
         with:
           submodules: true
 
-      - name: Enable tree foliage shadow capture
+      - name: Apply realistic shadow fixes
         shell: pwsh
-        run: |
-          $path = "libultraship/src/fast/interpreter.cpp"
-          $text = Get-Content -Path $path -Raw
-          $old = "if (mRdp->toon_shadow && !is_rect && (mRsp->geometry_mode & G_LIGHTING)) {"
-          $new = "if (mRdp->toon_shadow && !is_rect) {"
-          $count = ([regex]::Matches($text, [regex]::Escape($old))).Count
-          if ($count -ne 1) {
-            throw "Expected exactly one actor-shadow lighting gate, found $count."
-          }
-          $text = $text.Replace($old, $new)
-          Set-Content -Path $path -Value $text -Encoding utf8NoBOM -NoNewline
+        run: python scripts/apply_realistic_shadow_fixes.py
 
       - name: Configure sccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -195,3 +190,16 @@ jobs:
         with:
           key: ${{ steps.restore-cache-vcpkg.outputs.cache-primary-key }}
           path: vcpkg
+
+  cleanup-trigger:
+    name: Remove temporary build branch
+    if: always() && github.event_name == 'pull_request'
+    needs:
+      - generate-soh-otr
+      - build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete temporary branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/${{ github.head_ref }}" || true
