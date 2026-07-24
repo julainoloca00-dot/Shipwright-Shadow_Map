@@ -12,6 +12,9 @@ concurrency:
   group: validate-shadow-map-${{ github.event.pull_request.head.ref }}
   cancel-in-progress: false
 
+env:
+  LIBULTRASHIP_SHADOW_COMMIT: 1e3d13e04b3f365bcd86daff9baf0a603ccbd21a
+
 jobs:
   generate-soh-otr:
     runs-on: ubuntu-22.04
@@ -23,10 +26,11 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Use dynamic-shadow libultraship branch
+      - name: Pin validated libultraship shadow backend
         run: |
-          git -C libultraship fetch origin agent/dynamic-shadow-map-pcf
-          git -C libultraship checkout --detach origin/agent/dynamic-shadow-map-pcf
+          git -C libultraship fetch origin wind-waker-style-cel-shading
+          git -C libultraship checkout --detach "$LIBULTRASHIP_SHADOW_COMMIT"
+          test "$(git -C libultraship rev-parse HEAD)" = "$LIBULTRASHIP_SHADOW_COMMIT"
 
       - name: Apply camera-frustum caster culling
         run: python3 tools/apply_shadow_frustum_culling.py
@@ -80,15 +84,24 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Use validated dynamic-shadow libultraship branch
+      - name: Pin validated libultraship shadow backend
         shell: pwsh
         run: |
-          git -C libultraship fetch origin agent/dynamic-shadow-map-pcf
-          git -C libultraship checkout --detach origin/agent/dynamic-shadow-map-pcf
+          $ErrorActionPreference = "Stop"
+          git -C libultraship fetch origin wind-waker-style-cel-shading
+          git -C libultraship checkout --detach $env:LIBULTRASHIP_SHADOW_COMMIT
+          $actual = git -C libultraship rev-parse HEAD
+          if ($actual.Trim() -ne $env:LIBULTRASHIP_SHADOW_COMMIT) {
+            throw "Unexpected libultraship commit: $actual"
+          }
 
       - name: Apply camera-frustum caster culling
         shell: pwsh
-        run: python tools/apply_shadow_frustum_culling.py
+        run: |
+          $ErrorActionPreference = "Stop"
+          python tools/apply_shadow_frustum_culling.py
+          if ($LASTEXITCODE -ne 0) { throw "Frustum-culling patch failed with exit code $LASTEXITCODE" }
+          git diff --check
 
       - name: Install Ninja
         shell: pwsh
@@ -110,6 +123,7 @@ jobs:
         env:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         run: |
+          $ErrorActionPreference = "Stop"
           $env:PATH = "$env:USERPROFILE/.cargo/bin;$env:PATH"
           cmake -S . -B build-windows -G Ninja `
             -DCMAKE_MAKE_PROGRAM=ninja `
@@ -123,10 +137,12 @@ jobs:
       - name: Commit validated game integration
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           Remove-Item tools/apply_shadow_frustum_culling.py -Force
           Remove-Item .github/workflows/validate-dynamic-shadow-map.yml -Force
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add soh/soh/Enhancements/Graphics/ToonLighting.cpp libultraship tools/apply_shadow_frustum_culling.py .github/workflows/validate-dynamic-shadow-map.yml
+          git add -A
+          git diff --cached --check
           git commit -m "Integrate optimized dynamic shadow map and camera frustum culling [shadow-map-integrated]"
           git push origin HEAD:agent/dynamic-shadow-map-pcf
