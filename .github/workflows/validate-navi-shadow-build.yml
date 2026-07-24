@@ -1,0 +1,228 @@
+name: Validate Navi shadow fix
+
+on:
+  push:
+    branches:
+      - wind-waker-style-cel-shading
+    paths:
+      - .navi-shadow-build-trigger
+
+permissions:
+  contents: write
+
+concurrency:
+  group: validate-navi-shadow-fix
+  cancel-in-progress: true
+
+jobs:
+  generate-soh-otr:
+    name: Generate soh.o2r
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Git Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Configure ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          save: true
+          key: ${{ runner.os }}-navi-otr-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-navi-otr-
+            ${{ runner.os }}-otr-ccache
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y $(cat .github/workflows/apt-deps.txt) libzip-dev zipcmp zipmerge ziptool
+
+      - name: Restore Cached deps folder
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ runner.os }}-deps-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-deps-${{ github.ref }}-
+            ${{ runner.os }}-deps-
+          path: deps
+
+      - name: Create deps folder
+        run: mkdir -p deps
+
+      - name: Install latest SDL
+        run: |
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          if [ ! -d "deps/SDL2-2.30.3" ]; then
+            wget https://github.com/libsdl-org/SDL/releases/download/release-2.30.3/SDL2-2.30.3.tar.gz
+            tar -xzf SDL2-2.30.3.tar.gz -C deps
+          fi
+          cd deps/SDL2-2.30.3
+          ./configure --enable-hidapi-libusb
+          make -j 10
+          sudo make install
+          sudo cp -av /usr/local/lib/libSDL* /lib/x86_64-linux-gnu/
+
+      - name: Install latest tinyxml2
+        run: |
+          sudo apt-get remove -y libtinyxml2-dev || true
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          if [ ! -d "deps/tinyxml2-10.0.0" ]; then
+            wget https://github.com/leethomason/tinyxml2/archive/refs/tags/10.0.0.tar.gz
+            tar -xzf 10.0.0.tar.gz -C deps
+          fi
+          cd deps/tinyxml2-10.0.0
+          mkdir -p build
+          cd build
+          cmake ..
+          make -j 3
+          sudo make install
+
+      - name: Generate soh.o2r
+        run: |
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          cmake --no-warn-unused-cli -H. -Bbuild-cmake -GNinja -DCMAKE_BUILD_TYPE:STRING=Release
+          cmake --build build-cmake --config Release --target GenerateSohOtr -j3
+
+      - name: Upload soh.o2r
+        uses: actions/upload-artifact@v7
+        with:
+          name: soh.o2r
+          path: soh.o2r
+          if-no-files-found: error
+          retention-days: 3
+
+  build-windows:
+    name: Build Windows x64
+    needs: generate-soh-otr
+    runs-on: windows-latest
+    steps:
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          choco install ninja -y
+          Remove-Item -Path "C:\ProgramData\Chocolatey\bin\ccache.exe" -Force -ErrorAction SilentlyContinue
+
+      - name: Git Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Apply realistic shadow fixes
+        shell: pwsh
+        run: |
+          python scripts/apply_realistic_shadow_fixes.py
+          python scripts/refine_realistic_shadow_fixes.py
+
+      - name: Configure sccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          variant: sccache
+          max-size: "2G"
+          evict-old-files: job
+          save: true
+          key: ${{ runner.os }}-navi-shadow-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-navi-shadow-
+            ${{ runner.os }}-ccache
+
+      - name: Restore Cached VCPKG folder
+        id: restore-cache-vcpkg
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ runner.os }}-vcpkg-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-${{ github.ref }}-
+            ${{ runner.os }}-vcpkg-
+          path: vcpkg
+
+      - name: Configure Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Download soh.o2r
+        uses: actions/download-artifact@v7
+        with:
+          name: soh.o2r
+          path: build-windows/soh
+
+      - name: Build SoH
+        shell: pwsh
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          $env:PATH = "$env:USERPROFILE/.cargo/bin;$env:PATH"
+
+          cmake -S . -B build-windows -G Ninja `
+            -DCMAKE_MAKE_PROGRAM=ninja `
+            -DCMAKE_BUILD_TYPE:STRING=Release `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DBUILD_REMOTE_CONTROL=1
+
+          cmake --build build-windows --config Release --parallel 10
+          Push-Location build-windows
+          cpack
+          Pop-Location
+
+          $zip = @(
+            Get-ChildItem -Path "_packages" -Filter "*.zip" -File -ErrorAction SilentlyContinue
+            Get-ChildItem -Path "build-windows/_packages" -Filter "*.zip" -File -ErrorAction SilentlyContinue
+          ) | Select-Object -First 1
+
+          if (-not $zip) {
+            throw "CPack não gerou o pacote ZIP do Windows."
+          }
+
+          New-Item -ItemType Directory -Path "_packages" -Force | Out-Null
+          Copy-Item $zip.FullName "_packages/soh-windows.zip" -Force
+          Expand-Archive -Path "_packages/soh-windows.zip" -DestinationPath "soh-windows" -Force
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v7
+        with:
+          name: soh-windows-navi-light-fix
+          path: soh-windows
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Save Cache VCPKG folder
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.restore-cache-vcpkg.outputs.cache-primary-key }}
+          path: vcpkg
+
+  record-result:
+    name: Record validation result
+    needs: [generate-soh-otr, build-windows]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout current celshade branch
+        uses: actions/checkout@v6
+        with:
+          ref: wind-waker-style-cel-shading
+          fetch-depth: 0
+
+      - name: Record run and restore repository
+        env:
+          OTR_RESULT: ${{ needs.generate-soh-otr.result }}
+          WINDOWS_RESULT: ${{ needs.build-windows.result }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        shell: bash
+        run: |
+          cat > .navi-shadow-build-result.json <<EOF
+          {
+            "run_id": "${RUN_ID}",
+            "run_attempt": "${RUN_ATTEMPT}",
+            "generate_soh_otr": "${OTR_RESULT}",
+            "build_windows": "${WINDOWS_RESULT}"
+          }
+          EOF
+          rm -f .navi-shadow-build-trigger
+          rm -f .github/workflows/validate-navi-shadow-build.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .navi-shadow-build-result.json .navi-shadow-build-trigger .github/workflows/validate-navi-shadow-build.yml
+          git commit -m "Record Navi shadow validation result"
+          git push origin HEAD:wind-waker-style-cel-shading
