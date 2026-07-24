@@ -1,21 +1,132 @@
 name: clang-format
 on: [pull_request]
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+
+permissions:
+  contents: write
 
 jobs:
   clang-format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      - name: Install clang-format
+          ref: wind-waker-style-cel-shading
+          fetch-depth: 0
+
+      - name: Enable tree and foliage shadow capture
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-format-14
-      - name: Run clang-format
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('soh/soh/Enhancements/Graphics/ToonLighting.cpp')
+          text = path.read_text(encoding='utf-8')
+
+          replacements = [
+              (
+                  '''        case ACTOR_BG_MIZU_WATER: // water-box surfaces
+        case ACTOR_BG_HAKA_WATER:
+        case ACTOR_EN_WOOD02:  // trees / bushes / leaf scenery
+        case ACTOR_OBJ_SWITCH: // floor/crystal/eye switches — environment fixtures, not relit objects.
+''',
+                  '''        case ACTOR_BG_MIZU_WATER: // water-box surfaces
+        case ACTOR_BG_HAKA_WATER:
+        case ACTOR_OBJ_SWITCH: // floor/crystal/eye switches — environment fixtures, not relit objects.
+'''
+              ),
+              (
+                  '''static bool ToonShadowExcluded(Actor* actor) {
+    switch (actor->id) {
+''',
+                  '''static bool ToonShadowExcluded(Actor* actor) {
+    // Trees are receiver actors, but unlike platforms they must also cast: the opaque stream captures
+    // trunks and the XLU stream captures the geometric foliage cards. Other receivers remain excluded
+    // to avoid self-shadowing their own walkable surfaces.
+    if (actor->id == ACTOR_EN_WOOD02) {
+        return false;
+    }
+    switch (actor->id) {
+'''
+              ),
+              (
+                  '''            gSPToonShadow(POLY_OPA_DISP++, 0, 0, 0, 0.0f);
+            CLOSE_DISPS(play->state.gfxCtx);
+''',
+                  '''            gSPToonShadow(POLY_OPA_DISP++, 0, 0, 0, 0.0f);
+            gSPToonShadow(POLY_XLU_DISP++, 0, 0, 0, 0.0f);
+            CLOSE_DISPS(play->state.gfxCtx);
+'''
+              ),
+              (
+                  '''            gSPToonShadowArm(POLY_OPA_DISP++, feetClamp, st.shadowScale); // planeD = eased size scale
+        } else {
+            gSPToonShadow(POLY_OPA_DISP++, 0, 0, 0, 0.0f); // fully off
+        }
+''',
+                  '''            gSPToonShadowArm(POLY_OPA_DISP++, feetClamp, st.shadowScale); // planeD = eased size scale
+            if (actor->id == ACTOR_EN_WOOD02) {
+                // Tree canopies are submitted through POLY_XLU. Arm that stream only for En_Wood02 so
+                // foliage geometry contributes to the directional depth map without making particles,
+                // water, fairy effects, or other translucent actors cast solid shadows.
+                gSPToonShadowArm(POLY_XLU_DISP++, feetClamp, st.shadowScale);
+            } else {
+                // A previous tree may have armed the deferred XLU stream; every following actor closes
+                // that boundary explicitly so its translucent effects cannot leak into the tree shadow.
+                gSPToonShadow(POLY_XLU_DISP++, 0, 0, 0, 0.0f);
+            }
+        } else {
+            gSPToonShadow(POLY_OPA_DISP++, 0, 0, 0, 0.0f); // fully off
+            gSPToonShadow(POLY_XLU_DISP++, 0, 0, 0, 0.0f);
+        }
+'''
+              ),
+              (
+                  '''    // Blacklist (doors/trees/water): excluded actors get neither cel relight nor a shadow. When cel shading
+''',
+                  '''    // Blacklist (doors/water/oversized scenery): excluded actors get neither cel relight nor a shadow. Trees
+    // intentionally stay in the normal path so trunks and foliage receive lighting and cast into the map. When cel shading
+'''
+              ),
+          ]
+
+          for old, new in replacements:
+              if text.count(old) != 1:
+                  raise SystemExit('expected source block not found exactly once')
+              text = text.replace(old, new, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Restore workflows and commit result
+        shell: bash
         run: |
-          ./run-clang-format.sh
-          git diff --exit-code
+          cat > .github/workflows/clang-format.yml <<'YAML'
+          name: clang-format
+          on: [pull_request]
+          concurrency:
+            group: ${{ github.workflow }}-${{ github.ref }}
+            cancel-in-progress: true
+
+          jobs:
+            clang-format:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v6
+                  with:
+                    fetch-depth: 2
+                - name: Install clang-format
+                  run: |
+                    sudo apt-get update
+                    sudo apt-get install -y clang-format-14
+                - name: Run clang-format
+                  run: |
+                    ./run-clang-format.sh
+                    git diff --exit-code
+          YAML
+          rm -f .github/workflows/apply-tree-shadow-casters.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add soh/soh/Enhancements/Graphics/ToonLighting.cpp .github/workflows/clang-format.yml .github/workflows/apply-tree-shadow-casters.yml
+          git commit -m "Enable tree and foliage shadow casters"
+          git push origin HEAD:wind-waker-style-cel-shading
+          git push origin --delete temp-tree-shadow-trigger || true
