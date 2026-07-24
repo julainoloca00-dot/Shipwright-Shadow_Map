@@ -1,11 +1,12 @@
 // Corrective world-shadow light policy for Navi.
-// Revision: receiver-to-light direction, no radial shadow halo.
+// Revision: receiver-to-light direction, no radial shadow halo, and no fairy caster geometry.
 //
 // ToonLighting.cpp originally forwards Navi as a radial shadow-opacity mask. That creates a circular
 // light/dark boundary and can visually resemble a shadow emitted by the fairy. This module runs after
-// ToonLighting.cpp's frame hook and replaces that state with a directional approximation of a point light:
+// ToonLighting.cpp's hooks and replaces that state with a directional approximation of a point light:
 // the vector is computed from Link toward Navi, shadows project away from the fairy, and their opacity is
-// reduced mainly in dark environments. The radial backend light is explicitly disabled.
+// reduced mainly in dark environments. It also disarms both actor streams before Navi draws so the light
+// source itself can never be captured as shadow-casting geometry.
 
 #include <algorithm>
 #include <cmath>
@@ -18,9 +19,11 @@
 #include "soh/Enhancements/game-interactor/GameInteractor.h"
 #include "soh/ShipInit.hpp"
 #include "soh/cvar_prefixes.h"
+#include "soh/frame_interpolation.h"
 
 extern "C" {
 #include "functions.h"
+#include "macros.h"
 #include "variables.h"
 #include "z64.h"
 #include "overlays/actors/ovl_En_Elf/z_en_elf.h"
@@ -150,14 +153,32 @@ void ApplyNaviShadowLightFix() {
     interpreter->SetToonShadowParams(opacity, minElevation, slabDepth, slabRise, edgeSoftness, showVolume);
 }
 
+void PreventNaviShadowCaster(void* actorPointer) {
+    PlayState* play = gPlayState;
+    Actor* actor = static_cast<Actor*>(actorPointer);
+    if (play == nullptr || actor == nullptr || actor->id != ACTOR_EN_ELF || actor->params != FAIRY_NAVI ||
+        CVarGetInteger(CVAR_ENHANCEMENT("Graphics.WorldShadows.Enabled"), 0) == 0) {
+        return;
+    }
+
+    // ToonLighting.cpp may arm the generic actor caster before this later hook executes. Close both streams
+    // again before En_Elf submits any geometry: the fairy core, glow cards, and translucent particles must
+    // illuminate the scene but must never become occluders in the directional depth map.
+    OPEN_DISPS(play->state.gfxCtx);
+    gSPToonShadow(POLY_OPA_DISP++, 0, 0, 0, 0.0f);
+    gSPToonShadow(POLY_XLU_DISP++, 0, 0, 0, 0.0f);
+    CLOSE_DISPS(play->state.gfxCtx);
+}
+
 void RegisterNaviShadowLightFix() {
     COND_HOOK(OnGameFrameUpdate, true, ApplyNaviShadowLightFix);
+    COND_HOOK(OnActorDraw, true, PreventNaviShadowCaster);
 }
 
 } // namespace
 
-// The Z-prefixed filename sorts after ToonLighting.cpp in CMake's recursive glob, so this hook is
-// registered afterwards and intentionally becomes the final shadow-light policy for each frame.
+// The Z-prefixed filename sorts after ToonLighting.cpp in CMake's recursive glob, so these hooks are
+// registered afterwards and intentionally become the final shadow-light policy for each frame/actor draw.
 static RegisterShipInitFunc initNaviShadowLightFix(
     RegisterNaviShadowLightFix,
     { CVAR_ENHANCEMENT("Graphics.ToonLighting.UseNaviLight"),
