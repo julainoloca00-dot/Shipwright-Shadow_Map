@@ -138,6 +138,7 @@ jobs:
           python scripts/prevent_navi_caster_self_shadow.py
           python scripts/stabilize_environment_shadow_cell.py
           python scripts/merge_overlapping_shadow_passes.py
+          python scripts/fix_effective_camera_scope.py
 
       - name: Configure sccache
         uses: hendrikmuhs/ccache-action@v1.2
