@@ -1,82 +1,189 @@
 name: Windows manual build
 
 on:
-  pull_request:
-    types: [opened, reopened, synchronize]
-    branches:
-      - wind-waker-style-cel-shading
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  consolidate-shadow-branches:
-    if: github.event.pull_request.head.ref == 'agent/fix-navi-shadow-map'
-    runs-on: ubuntu-latest
+  generate-soh-otr:
+    name: Generate soh.o2r
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Git Checkout
+        uses: actions/checkout@v6
         with:
-          ref: wind-waker-style-cel-shading
-          fetch-depth: 0
           submodules: true
 
-      - name: Update libultraship to consolidated production commit
-        shell: bash
-        run: |
-          git -C libultraship fetch origin wind-waker-style-cel-shading
-          git -C libultraship checkout 1f70e6c3404525df54ed755f6df47ce38a73915b
-          git add libultraship
+      - name: Configure ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          save: ${{ github.ref_name == github.event.repository.default_branch }}
+          key: ${{ runner.os }}-otr-ccache-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-otr-ccache-${{ github.ref }}
+            ${{ runner.os }}-otr-ccache
 
-      - name: Restore build workflow and commit gitlink
-        shell: bash
+      - name: Install dependencies
         run: |
-          git checkout HEAD^ -- .github/workflows/generate-builds.yml
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add libultraship .github/workflows/generate-builds.yml
-          git commit -m "Update consolidated libultraship shadow changes"
-          git push origin HEAD:wind-waker-style-cel-shading
+          sudo apt-get update
+          sudo apt-get install -y $(cat .github/workflows/apt-deps.txt) libzip-dev zipcmp zipmerge ziptool
 
-      - name: Delete consolidated branches
-        shell: bash
+      - name: Restore Cached deps folder
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ runner.os }}-deps-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-deps-${{ github.ref }}-
+            ${{ runner.os }}-deps-
+          path: deps
+
+      - name: Create deps folder
+        run: mkdir -p deps
+
+      - name: Install latest SDL
+        run: |
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          if [ ! -d "deps/SDL2-2.30.3" ]; then
+            wget https://github.com/libsdl-org/SDL/releases/download/release-2.30.3/SDL2-2.30.3.tar.gz
+            tar -xzf SDL2-2.30.3.tar.gz -C deps
+          fi
+          cd deps/SDL2-2.30.3
+          ./configure --enable-hidapi-libusb
+          make -j 10
+          sudo make install
+          sudo cp -av /usr/local/lib/libSDL* /lib/x86_64-linux-gnu/
+
+      - name: Install latest tinyxml2
+        run: |
+          sudo apt-get remove -y libtinyxml2-dev || true
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          if [ ! -d "deps/tinyxml2-10.0.0" ]; then
+            wget https://github.com/leethomason/tinyxml2/archive/refs/tags/10.0.0.tar.gz
+            tar -xzf 10.0.0.tar.gz -C deps
+          fi
+          cd deps/tinyxml2-10.0.0
+          mkdir -p build
+          cd build
+          cmake ..
+          make -j 3
+          sudo make install
+
+      - name: Generate soh.o2r
+        run: |
+          export PATH="/usr/lib/ccache:/usr/local/opt/ccache/libexec:$PATH"
+          cmake --no-warn-unused-cli -H. -Bbuild-cmake -GNinja -DCMAKE_BUILD_TYPE:STRING=Release
+          cmake --build build-cmake --config Release --target GenerateSohOtr -j3
+
+      - name: Upload soh.o2r
+        uses: actions/upload-artifact@v7
+        with:
+          name: soh.o2r
+          path: soh.o2r
+          if-no-files-found: error
+          retention-days: 3
+
+  build-windows:
+    name: Build Windows x64
+    needs: generate-soh-otr
+    runs-on: windows-latest
+    steps:
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          choco install ninja -y
+          Remove-Item -Path "C:\ProgramData\Chocolatey\bin\ccache.exe" -Force -ErrorAction SilentlyContinue
+
+      - name: Git Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: true
+
+      - name: Apply realistic shadow fixes
+        shell: pwsh
+        run: |
+          python scripts/apply_realistic_shadow_fixes.py
+          python scripts/refine_realistic_shadow_fixes.py
+
+      - name: Configure sccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          variant: sccache
+          max-size: "2G"
+          evict-old-files: job
+          save: ${{ github.ref_name == github.event.repository.default_branch }}
+          key: ${{ runner.os }}-ccache-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-${{ github.ref }}
+            ${{ runner.os }}-ccache
+
+      - name: Restore Cached VCPKG folder
+        id: restore-cache-vcpkg
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ runner.os }}-vcpkg-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-${{ github.ref }}-
+            ${{ runner.os }}-vcpkg-
+          path: vcpkg
+
+      - name: Configure Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Download soh.o2r
+        uses: actions/download-artifact@v7
+        with:
+          name: soh.o2r
+          path: build-windows/soh
+
+      - name: Build SoH
+        shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         run: |
-          set -u
-          delete_branch() {
-            local branch="$1"
-            local encoded="${branch//\//%2F}"
-            local status
-            status=$(curl -sS -L -o /tmp/delete-response -w '%{http_code}' \
-              -X DELETE \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${REPOSITORY}/git/refs/heads/${encoded}")
-            if [ "${status}" != "204" ] && [ "${status}" != "404" ] && [ "${status}" != "422" ]; then
-              cat /tmp/delete-response
-              echo "Failed to delete ${branch}: HTTP ${status}"
-              return 1
-            fi
-            echo "${branch}: HTTP ${status}"
+          $env:PATH = "$env:USERPROFILE/.cargo/bin;$env:PATH"
+
+          cmake -S . -B build-windows -G Ninja `
+            -DCMAKE_MAKE_PROGRAM=ninja `
+            -DCMAKE_BUILD_TYPE:STRING=Release `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DBUILD_REMOTE_CONTROL=1
+
+          cmake --build build-windows --config Release --parallel 10
+          Push-Location build-windows
+          cpack
+          Pop-Location
+
+          $zip = @(
+            Get-ChildItem -Path "_packages" -Filter "*.zip" -File -ErrorAction SilentlyContinue
+            Get-ChildItem -Path "build-windows/_packages" -Filter "*.zip" -File -ErrorAction SilentlyContinue
+          ) | Select-Object -First 1
+
+          if (-not $zip) {
+            throw "CPack não gerou o pacote ZIP do Windows."
           }
 
-          for branch in \
-            agent/fix-navi-shadow-map \
-            temp-navi-light-fix \
-            temp-navi-light-fix-v2 \
-            temp-realistic-shadow-build \
-            temp-ship-foliage-build \
-            temp-tree-shadow-trigger \
-            trigger-shadow-build-status \
-            trigger-ultra-shadow-final \
-            trigger-ultra-shadow-once \
-            agent/stabilize-shadow-quality \
-            agent/fix-world-shadow-map \
-            agent/windows-artifact-build-fix \
-            agent/dynamic-shadow-map-pcf \
-            agent/link-shadow-map-windows-manual-build \
-            main; do
-            delete_branch "${branch}" || true
-          done
+          New-Item -ItemType Directory -Path "_packages" -Force | Out-Null
+          Copy-Item $zip.FullName "_packages/soh-windows.zip" -Force
+          Expand-Archive -Path "_packages/soh-windows.zip" -DestinationPath "soh-windows" -Force
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v7
+        with:
+          name: soh-windows
+          path: soh-windows
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Save Cache VCPKG folder
+        if: ${{ github.ref_name == github.event.repository.default_branch }}
+        uses: actions/cache/save@v5
+        with:
+          key: ${{ steps.restore-cache-vcpkg.outputs.cache-primary-key }}
+          path: vcpkg
