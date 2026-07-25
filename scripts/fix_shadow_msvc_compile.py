@@ -11,7 +11,46 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
 root = Path(__file__).resolve().parents[1]
 
 # -------------------------------------------------------------------------------------------------
-# MSVC fixes and two-layer shadow resolve for the generated libultraship code.
+# Extend the generated interpreter state with a separate accumulator for physically large actors.
+# Large actor shadows (trees, bosses, oversized props) use the weak local-light response together with
+# the static world; compact actors and props use the strong Navi response.
+# -------------------------------------------------------------------------------------------------
+header_path = root / "libultraship/include/fast/interpreter.h"
+header_text = header_path.read_text(encoding="utf-8")
+
+old_actor_accumulator = '''    std::vector<float> mShadowCasterAccum;
+    // Visible opaque environment triangles captured before the actor pass.'''
+new_actor_accumulator = '''    std::vector<float> mShadowCasterAccum;
+    // Dynamic casters whose captured world-space bounds are too large for a point light to erase as one
+    // compact shadow. They are resolved with the weaker environment-style local fill.
+    std::vector<float> mLargeShadowCasterAccum;
+    // Visible opaque environment triangles captured before the actor pass.'''
+header_text = replace_once(
+    header_text,
+    old_actor_accumulator,
+    new_actor_accumulator,
+    "large-caster accumulator declaration",
+)
+
+old_disable_cleanup = '''            mEnvironmentShadowTriangleHashes.clear();
+            mEnvironmentShadowCacheAnchorValid = false;
+            mShadowCasterAccum.clear();
+            mShadowVerts.clear();'''
+new_disable_cleanup = '''            mEnvironmentShadowTriangleHashes.clear();
+            mEnvironmentShadowCacheAnchorValid = false;
+            mShadowCasterAccum.clear();
+            mLargeShadowCasterAccum.clear();
+            mShadowVerts.clear();'''
+header_text = replace_once(
+    header_text,
+    old_disable_cleanup,
+    new_disable_cleanup,
+    "large-caster disable cleanup",
+)
+header_path.write_text(header_text, encoding="utf-8", newline="\n")
+
+# -------------------------------------------------------------------------------------------------
+# MSVC fixes, caster-size classification and layered shadow resolve for generated libultraship code.
 # -------------------------------------------------------------------------------------------------
 interpreter_path = root / "libultraship/src/fast/interpreter.cpp"
 interpreter_text = interpreter_path.read_text(encoding="utf-8")
@@ -35,6 +74,68 @@ interpreter_text = replace_once(
 
 # Use the standard C++ overload instead of relying on the global C spelling exposed by a specific CRT.
 interpreter_text = interpreter_text.replace("llroundf(", "std::llround(")
+
+old_flush = '''void Interpreter::FlushToonShadow() {
+    const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
+    if (mShadowVerts.size() < 9 || coreAlpha <= 0.0f || !mRdp->toon_shadow) {
+        mShadowVerts.clear();
+        return;
+    }
+
+    // Keep the buffer bounded. The data is three floats per vertex and is consumed once per frame.
+    // Drop newest casters once the budget is full, matching the old volume accumulator's behavior.
+    const size_t available =
+        mShadowCasterAccum.size() < kShadowAccumBudgetFloats ? kShadowAccumBudgetFloats - mShadowCasterAccum.size() : 0;
+    const size_t copyFloats = std::min(mShadowVerts.size(), available - (available % 9));
+    if (copyFloats >= 9) {
+        mShadowCasterAccum.insert(mShadowCasterAccum.end(), mShadowVerts.begin(), mShadowVerts.begin() + copyFloats);
+    }
+
+    mShadowVerts.clear();
+}'''
+new_flush = '''void Interpreter::FlushToonShadow() {
+    const float coreAlpha = std::clamp(mToonShadowAlpha, 0.0f, 1.0f);
+    if (mShadowVerts.size() < 9 || coreAlpha <= 0.0f || !mRdp->toon_shadow) {
+        mShadowVerts.clear();
+        return;
+    }
+
+    // Classify the complete current object by its world-space bounds. Compact casters can have most of their
+    // directional shadow cleared by a nearby point light. Trees, bosses and oversized props keep a weaker,
+    // world-like shadow response so Navi never punches an implausibly large circular hole through them.
+    float minimum[3] = { mShadowVerts[0], mShadowVerts[1], mShadowVerts[2] };
+    float maximum[3] = { minimum[0], minimum[1], minimum[2] };
+    for (size_t offset = 3; offset + 2 < mShadowVerts.size(); offset += 3) {
+        minimum[0] = std::min(minimum[0], mShadowVerts[offset + 0]);
+        minimum[1] = std::min(minimum[1], mShadowVerts[offset + 1]);
+        minimum[2] = std::min(minimum[2], mShadowVerts[offset + 2]);
+        maximum[0] = std::max(maximum[0], mShadowVerts[offset + 0]);
+        maximum[1] = std::max(maximum[1], mShadowVerts[offset + 1]);
+        maximum[2] = std::max(maximum[2], mShadowVerts[offset + 2]);
+    }
+    constexpr float kLargeLocalLightCasterExtent = 240.0f;
+    const bool largeCaster = maximum[0] - minimum[0] > kLargeLocalLightCasterExtent ||
+                             maximum[1] - minimum[1] > kLargeLocalLightCasterExtent ||
+                             maximum[2] - minimum[2] > kLargeLocalLightCasterExtent;
+    std::vector<float>& destination = largeCaster ? mLargeShadowCasterAccum : mShadowCasterAccum;
+
+    // Keep each frame buffer bounded. Drop newest casters once its budget is full instead of growing without limit.
+    const size_t available = destination.size() < kShadowAccumBudgetFloats
+                                 ? kShadowAccumBudgetFloats - destination.size()
+                                 : 0;
+    const size_t copyFloats = std::min(mShadowVerts.size(), available - (available % 9));
+    if (copyFloats >= 9) {
+        destination.insert(destination.end(), mShadowVerts.begin(), mShadowVerts.begin() + copyFloats);
+    }
+
+    mShadowVerts.clear();
+}'''
+interpreter_text = replace_once(
+    interpreter_text,
+    old_flush,
+    new_flush,
+    "classify compact and large actor casters",
+)
 
 old_combined_resolve = '''    // Temporarily append dynamic actor casters to the stable world cache for this resolve only.
     const size_t stableEnvironmentFloats = mEnvironmentShadowCasterCache.size();
@@ -80,8 +181,21 @@ new_layered_resolve = '''    // Fast3D applies its widescreen correction to clip
         }
     }
 
-    // Resolve static/world casters first. A negative radius selects the weaker local-fill strength in the
-    // DX11 shader, so a large tree/building shadow is only softened instead of becoming a circular hole.
+    // Large dynamic casters join the world cache only for this frame's weak-fill resolve. They are not persisted.
+    const size_t stableEnvironmentFloats = mEnvironmentShadowCasterCache.size();
+    const size_t availableForLargeCasters = stableEnvironmentFloats < kShadowAccumBudgetFloats
+                                                ? kShadowAccumBudgetFloats - stableEnvironmentFloats
+                                                : 0;
+    const size_t largeCasterFloats =
+        std::min(mLargeShadowCasterAccum.size(), availableForLargeCasters - (availableForLargeCasters % 9));
+    if (largeCasterFloats >= 9) {
+        mEnvironmentShadowCasterCache.insert(mEnvironmentShadowCasterCache.end(),
+                                             mLargeShadowCasterAccum.begin(),
+                                             mLargeShadowCasterAccum.begin() + largeCasterFloats);
+    }
+
+    // Resolve static/world and physically large casters first. A negative radius selects the weaker local-fill
+    // strength in the DX11 shader, so their shadows are softened rather than erased as a circular hole.
     if (mEnvironmentShadowCasterCache.size() >= 9) {
         float environmentLocalLight[4] = { mDynamicShadowLocalLight[0], mDynamicShadowLocalLight[1],
                                            mDynamicShadowLocalLight[2], mDynamicShadowLocalLight[3] };
@@ -94,9 +208,10 @@ new_layered_resolve = '''    // Fast3D applies its widescreen correction to clip
             mDynamicShadowAnchor, environmentLocalLight, kDynamicShadowMapResolution,
             std::clamp(mToonShadowAlpha, 0.0f, 1.0f), kDynamicShadowMapBias, kDynamicShadowMapPcfRadius);
     }
+    mEnvironmentShadowCasterCache.resize(stableEnvironmentFloats);
 
-    // Resolve dynamic actors separately with the positive radius/strong local fill. This lets Navi remove or
-    // heavily soften the compact shadows of Link, NPCs, enemies and props without weakening the whole world.
+    // Resolve compact dynamic actors separately with the positive radius/strong local fill. Navi can heavily
+    // soften Link, NPC, enemy and small-prop shadows without weakening trees, bosses or the whole world.
     if (mShadowCasterAccum.size() >= 9) {
         const size_t actorVertexCount = mShadowCasterAccum.size() / 3;
         mRapi->RenderDynamicShadowMap(
@@ -105,12 +220,13 @@ new_layered_resolve = '''    // Fast3D applies its widescreen correction to clip
             std::clamp(mToonShadowAlpha, 0.0f, 1.0f), kDynamicShadowMapBias, kDynamicShadowMapPcfRadius);
     }
 
-    mShadowCasterAccum.clear();'''
+    mShadowCasterAccum.clear();
+    mLargeShadowCasterAccum.clear();'''
 interpreter_text = replace_once(
     interpreter_text,
     old_combined_resolve,
     new_layered_resolve,
-    "split environment and actor shadow resolves",
+    "split environment, large-caster and compact-actor shadow response",
 )
 interpreter_path.write_text(interpreter_text, encoding="utf-8", newline="\n")
 
@@ -137,8 +253,8 @@ actor_draw_path.write_text(actor_draw_text, encoding="utf-8", newline="\n")
 
 # -------------------------------------------------------------------------------------------------
 # Signed local-light radius selects the fill strength per shadow layer:
-#   positive radius = strong actor-shadow clearing (85% at the centre),
-#   negative radius = weak world-shadow softening (35% at the centre).
+#   positive radius = strong compact-actor clearing (85% at the centre),
+#   negative radius = weak world/large-caster softening (35% at the centre).
 # Patch both normal and MSAA resolve shaders.
 # -------------------------------------------------------------------------------------------------
 backend_path = root / "libultraship/src/fast/backends/gfx_direct3d11_shadow_map.inc"
@@ -217,7 +333,7 @@ navi_policy_text = replace_once(
     }
 
     // Navi remains excluded from caster capture and never changes the stable sun/moon direction. Her local
-    // radius is consumed separately by the weak world pass and the strong actor pass.
+    // radius is consumed separately by the weak world/large pass and the strong compact-actor pass.
     interpreter->SetDynamicShadowCaptureState(true, sStableShadowDirection, anchor, localShadowLight);''',
     "restore Navi local shadow fill",
 )
@@ -225,5 +341,5 @@ navi_policy_text = replace_once(
 navi_policy_path.write_text(navi_policy_text, encoding="utf-8", newline="\n")
 
 print(
-    "Applied MSVC fixes, restored Navi lightcasting, and split weak world/strong actor shadow interaction."
+    "Applied MSVC fixes, restored Navi lightcasting, and split weak world/large and strong compact shadow response."
 )
