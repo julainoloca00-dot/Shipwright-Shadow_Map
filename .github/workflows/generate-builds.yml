@@ -132,6 +132,7 @@ jobs:
           python scripts/fix_shadow_runtime_stability.py
           python scripts/prepare_shadow_local_fill.py
           python scripts/fix_shadow_msvc_compile.py
+          python scripts/fix_shadow_visibility_and_artifacts.py
 
       - name: Configure sccache
         uses: hendrikmuhs/ccache-action@v1.2
