@@ -130,6 +130,7 @@ jobs:
           python scripts/apply_realistic_shadow_fixes.py
           python scripts/refine_realistic_shadow_fixes.py
           python scripts/fix_shadow_runtime_stability.py
+          python scripts/fix_shadow_msvc_compile.py
 
       - name: Configure sccache
         uses: hendrikmuhs/ccache-action@v1.2
