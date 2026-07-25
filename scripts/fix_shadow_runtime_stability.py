@@ -241,7 +241,7 @@ def patch_interpreter(root: Path) -> None:
             hashVertex(triangle[3], triangle[4], triangle[5]),
             hashVertex(triangle[6], triangle[7], triangle[8]),
         };
-        std::sort(std::begin(vertices), std::end(vertices));
+        std::sort(vertices, vertices + 3);
         uint64_t hash = 1469598103934665603ULL;
         for (uint64_t vertex : vertices) {
             hash ^= vertex;
