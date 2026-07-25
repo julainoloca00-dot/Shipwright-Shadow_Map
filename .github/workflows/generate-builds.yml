@@ -138,7 +138,6 @@ jobs:
           python scripts/prevent_navi_caster_self_shadow.py
           python scripts/stabilize_environment_shadow_cell.py
           python scripts/merge_overlapping_shadow_passes.py
-          python scripts/fix_shadow_merge_build_order.py
 
       - name: Configure sccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -177,18 +176,58 @@ jobs:
           VCPKG_ROOT: ${{ github.workspace }}/vcpkg
         run: |
           $env:PATH = "$env:USERPROFILE/.cargo/bin;$env:PATH"
+          New-Item -ItemType Directory -Path "_diagnostics" -Force | Out-Null
+          $buildLog = Join-Path (Resolve-Path "_diagnostics").Path "windows-build.log"
+          $errorLog = Join-Path (Resolve-Path "_diagnostics").Path "build-errors.txt"
 
-          cmake -S . -B build-windows -G Ninja `
+          function Stop-WithBuildDiagnostics([string]$stage, [int]$exitCode) {
+            $patterns = @(
+              'error C[0-9]+',
+              'fatal error',
+              'FAILED:',
+              'ninja: build stopped',
+              'CMake Error',
+              'CPack Error',
+              'Process completed with exit code'
+            )
+            $matches = Select-String -Path $buildLog -Pattern $patterns -CaseSensitive:$false |
+              Select-Object -Last 160
+            $report = @("Stage: $stage", "Exit code: $exitCode", "")
+            if ($matches) {
+              $report += $matches.Line
+            } else {
+              $report += Get-Content $buildLog -Tail 240
+            }
+            $report | Set-Content -Path $errorLog -Encoding utf8
+            $report | ForEach-Object { Write-Host $_ }
+            exit $exitCode
+          }
+
+          & cmake -S . -B build-windows -G Ninja `
             -DCMAKE_MAKE_PROGRAM=ninja `
             -DCMAKE_BUILD_TYPE:STRING=Release `
             -DCMAKE_C_COMPILER_LAUNCHER=sccache `
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
-            -DBUILD_REMOTE_CONTROL=1
+            -DBUILD_REMOTE_CONTROL=1 2>&1 | Tee-Object -FilePath $buildLog
+          $configureExit = $LASTEXITCODE
+          if ($configureExit -ne 0) {
+            Stop-WithBuildDiagnostics "Configure" $configureExit
+          }
 
-          cmake --build build-windows --config Release --parallel 10
+          & cmake --build build-windows --config Release --parallel 10 2>&1 |
+            Tee-Object -FilePath $buildLog -Append
+          $compileExit = $LASTEXITCODE
+          if ($compileExit -ne 0) {
+            Stop-WithBuildDiagnostics "Compile" $compileExit
+          }
+
           Push-Location build-windows
-          cpack
+          & cpack 2>&1 | Tee-Object -FilePath $buildLog -Append
+          $packageExit = $LASTEXITCODE
           Pop-Location
+          if ($packageExit -ne 0) {
+            Stop-WithBuildDiagnostics "Package" $packageExit
+          }
 
           $zip = @(
             Get-ChildItem -Path "_packages" -Filter "*.zip" -File -ErrorAction SilentlyContinue
@@ -196,12 +235,23 @@ jobs:
           ) | Select-Object -First 1
 
           if (-not $zip) {
+            @("Stage: Package", "CPack não gerou o pacote ZIP do Windows.") |
+              Set-Content -Path $errorLog -Encoding utf8
             throw "CPack não gerou o pacote ZIP do Windows."
           }
 
           New-Item -ItemType Directory -Path "_packages" -Force | Out-Null
           Copy-Item $zip.FullName "_packages/soh-windows.zip" -Force
           Expand-Archive -Path "_packages/soh-windows.zip" -DestinationPath "soh-windows" -Force
+
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-build-errors
+          path: _diagnostics
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Upload Windows build
         uses: actions/upload-artifact@v7
