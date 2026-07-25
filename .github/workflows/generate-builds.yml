@@ -32,7 +32,27 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y $(cat .github/workflows/apt-deps.txt) libzip-dev zipcmp zipmerge ziptool
+          sudo apt-get install -y \
+            libusb-dev \
+            libusb-1.0-0-dev \
+            libsdl2-dev \
+            libsdl2-net-dev \
+            libpng-dev \
+            libglew-dev \
+            nlohmann-json3-dev \
+            libtinyxml2-dev \
+            libspdlog-dev \
+            ninja-build \
+            libogg-dev \
+            libopus-dev \
+            opus-tools \
+            libopusfile-dev \
+            libvorbis-dev \
+            libespeak-ng-dev \
+            libzip-dev \
+            zipcmp \
+            zipmerge \
+            ziptool
 
       - name: Restore Cached deps folder
         uses: actions/cache/restore@v5
