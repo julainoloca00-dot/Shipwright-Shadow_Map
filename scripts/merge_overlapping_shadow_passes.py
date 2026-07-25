@@ -35,6 +35,29 @@ def patch_interpreter(root: Path) -> None:
             1,
         )
 
+    # Resolve compact actor layers first. The later world layer then fills only stencil pixels that remain clear.
+    # This makes a strong actor/Navi shadow win over a weak locally lifted environment shadow at an overlap.
+    world_start_marker = "    // Resolve static/world and physically large casters first."
+    world_end_line = "    mEnvironmentShadowCasterCache.resize(stableEnvironmentFloats);"
+    world_start = function.find(world_start_marker)
+    world_end = function.find(world_end_line, world_start)
+    if world_start < 0 or world_end < 0:
+        raise RuntimeError("shadow layer ordering: world resolve block not found")
+    world_end += len(world_end_line)
+    world_block = function[world_start:world_end]
+    world_block = world_block.replace(
+        "Resolve static/world and physically large casters first.",
+        "Resolve static/world and physically large casters after compact actors.",
+        1,
+    )
+    function = function[:world_start] + function[world_end:]
+
+    clear_marker = "    mShadowCasterAccum.clear();"
+    clear_pos = function.find(clear_marker)
+    if clear_pos < 0:
+        raise RuntimeError("shadow layer ordering: final actor clear marker not found")
+    function = function[:clear_pos] + world_block + "\n\n" + function[clear_pos:]
+
     old_tail = "kDynamicShadowMapBias, kDynamicShadowMapPcfRadius);"
     call_count = function.count(old_tail)
     if call_count < 2 or call_count > 8:
