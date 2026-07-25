@@ -27,27 +27,31 @@ def patch_interpreter_header(root: Path) -> None:
     if "struct NaviShadowCasterBatch" not in text:
         marker = "    std::vector<float> mShadowCasterAccum;"
         addition = '''
-    // Each compact caster affected by Navi keeps its own geometry range and centre. A shared average centre
-    // produced incorrect angles and stretched shadows whenever Link and another actor were affected together.
+    // Every compact caster that needs an independent projection stores its own geometry range, stable world anchor,
+    // receiver floor and light-selection mode. Link always uses this path; actors near Navi use it while illuminated.
     struct NaviShadowCasterBatch {
         size_t firstFloat = 0;
         size_t floatCount = 0;
         float center[3] = { 0.0f, 0.0f, 0.0f };
+        float shadowAnchor[3] = { 0.0f, 0.0f, 0.0f };
+        float receiverFloorY = 0.0f;
+        float receiverRadius = 64.0f;
+        bool useNaviDirection = false;
     };
     std::vector<float> mNaviShadowCasterAccum;
     std::vector<NaviShadowCasterBatch> mNaviShadowCasterBatches;'''
-        text = insert_after_once(text, marker, addition, "per-caster Navi shadow state")
+        text = insert_after_once(text, marker, addition, "per-caster compact shadow state")
 
     if "mNaviShadowCasterBatches.clear();" not in text:
         disabled = text.find("if (!enabled)")
         if disabled < 0:
-            raise RuntimeError("per-caster Navi cleanup: disabled-state block not found")
+            raise RuntimeError("per-caster compact cleanup: disabled-state block not found")
         actor_clear = text.find("mShadowCasterAccum.clear();", disabled)
         if actor_clear < 0:
-            raise RuntimeError("per-caster Navi cleanup: actor clear not found")
+            raise RuntimeError("per-caster compact cleanup: actor clear not found")
         line_end = text.find("\n", actor_clear)
         if line_end < 0:
-            raise RuntimeError("per-caster Navi cleanup: actor clear line end not found")
+            raise RuntimeError("per-caster compact cleanup: actor clear line end not found")
         indent_start = text.rfind("\n", 0, actor_clear) + 1
         indent = text[indent_start:actor_clear]
         cleanup = (
@@ -72,8 +76,6 @@ def patch_interpreter(root: Path) -> None:
         return;
     }
 
-    // Classify the complete current object by world-space bounds. Large actors retain the environmental
-    // direction. Every compact caster close to visible Navi receives its own batch, centre and direction.
     float minimum[3] = { mShadowVerts[0], mShadowVerts[1], mShadowVerts[2] };
     float maximum[3] = { minimum[0], minimum[1], minimum[2] };
     for (size_t offset = 3; offset + 2 < mShadowVerts.size(); offset += 3) {
@@ -95,6 +97,7 @@ def patch_interpreter(root: Path) -> None:
         (minimum[1] + maximum[1]) * 0.5f,
         (minimum[2] + maximum[2]) * 0.5f,
     };
+
     constexpr float kNaviDirectionInfluenceRadius = 220.0f;
     const float publishedRadius = std::fabs(mDynamicShadowLocalLight[3]);
     const float naviRadius = std::min(publishedRadius, kNaviDirectionInfluenceRadius);
@@ -106,33 +109,61 @@ def patch_interpreter(root: Path) -> None:
     const float halfExtentZ = (maximum[2] - minimum[2]) * 0.5f;
     const float actorHalfExtent = std::max(halfExtentX, std::max(halfExtentY, halfExtentZ));
     const float effectiveNaviRadius = naviRadius + std::min(actorHalfExtent, 64.0f);
-    const bool insideNaviRadius = naviRadius > 0.0f &&
-                                  naviDx * naviDx + naviDy * naviDy + naviDz * naviDz <=
-                                      effectiveNaviRadius * effectiveNaviRadius;
+    const bool insideNaviRadius =
+        naviRadius > 0.0f &&
+        naviDx * naviDx + naviDy * naviDy + naviDz * naviDz <= effectiveNaviRadius * effectiveNaviRadius;
 
-    // Each nearby actor requires its own projection direction. Cap the extra passes; overflow actors keep
-    // the stable environmental direction rather than being merged into a geometrically incorrect average.
-    constexpr size_t kMaxNaviShadowBatches = 6;
-    const bool useNaviBatch =
-        !largeCaster && insideNaviRadius && mNaviShadowCasterBatches.size() < kMaxNaviShadowBatches;
-    std::vector<float>& destination = largeCaster
-                                          ? mLargeShadowCasterAccum
-                                          : (useNaviBatch ? mNaviShadowCasterAccum : mShadowCasterAccum);
+    // Link is the compact caster whose centre surrounds the player/floor anchor published once per frame.
+    // Keeping him in an independent pass prevents his geometry from being merged into the ordinary actor layer,
+    // which previously allowed his own projected shadow to darken his body.
+    const float playerDx = center[0] - mDynamicShadowAnchor[0];
+    const float playerDy = center[1] - mDynamicShadowAnchor[1];
+    const float playerDz = center[2] - mDynamicShadowAnchor[2];
+    const bool isPlayerCaster =
+        !largeCaster && playerDx * playerDx + playerDz * playerDz <= 56.0f * 56.0f &&
+        std::fabs(playerDy) <= 224.0f;
+
+    constexpr size_t kMaxNaviAffectedShadowBatches = 7;
+    const bool useIndividualBatch =
+        !largeCaster &&
+        (isPlayerCaster ||
+         (insideNaviRadius && mNaviShadowCasterBatches.size() < kMaxNaviAffectedShadowBatches));
+    std::vector<float>& destination =
+        largeCaster ? mLargeShadowCasterAccum
+                    : (useIndividualBatch ? mNaviShadowCasterAccum : mShadowCasterAccum);
 
     const size_t firstFloat = destination.size();
-    const size_t available = destination.size() < kShadowAccumBudgetFloats
-                                 ? kShadowAccumBudgetFloats - destination.size()
-                                 : 0;
+    const size_t available =
+        destination.size() < kShadowAccumBudgetFloats ? kShadowAccumBudgetFloats - destination.size() : 0;
     const size_t copyFloats = std::min(mShadowVerts.size(), available - (available % 9));
     if (copyFloats >= 9) {
         destination.insert(destination.end(), mShadowVerts.begin(), mShadowVerts.begin() + copyFloats);
-        if (useNaviBatch) {
+        if (useIndividualBatch) {
             NaviShadowCasterBatch batch;
             batch.firstFloat = firstFloat;
             batch.floatCount = copyFloats;
-            batch.center[0] = center[0];
-            batch.center[1] = center[1];
-            batch.center[2] = center[2];
+
+            constexpr float kCompactAnchorGrid = 4.0f;
+            auto snapCompactAnchor = [](float value) {
+                return std::floor(value / kCompactAnchorGrid + 0.5f) * kCompactAnchorGrid;
+            };
+
+            batch.center[0] = snapCompactAnchor(center[0]);
+            batch.center[1] = snapCompactAnchor(center[1]);
+            batch.center[2] = snapCompactAnchor(center[2]);
+
+            const float receiverFloorY =
+                mRsp->toon_shadow_clamp_feet ? mRsp->toon_shadow_feet_clamp_y : minimum[1];
+            batch.shadowAnchor[0] =
+                snapCompactAnchor(isPlayerCaster ? mDynamicShadowAnchor[0] : center[0]);
+            batch.shadowAnchor[1] = receiverFloorY;
+            batch.shadowAnchor[2] =
+                snapCompactAnchor(isPlayerCaster ? mDynamicShadowAnchor[2] : center[2]);
+            batch.receiverFloorY = receiverFloorY;
+
+            const float horizontalExtent = std::max(halfExtentX, halfExtentZ);
+            batch.receiverRadius = std::clamp(horizontalExtent * 1.75f + 32.0f, 56.0f, 144.0f);
+            batch.useNaviDirection = insideNaviRadius;
             mNaviShadowCasterBatches.push_back(batch);
         }
     }
@@ -146,12 +177,12 @@ def patch_interpreter(root: Path) -> None:
         flush_start,
         render_start,
         flush,
-        "per-caster Navi routing",
+        "stable compact-caster routing",
     )
 
     render_function = text.find(render_start)
     if render_function < 0:
-        raise RuntimeError("per-caster Navi resolve: render function not found")
+        raise RuntimeError("stable compact-caster resolve: render function not found")
 
     compact_candidates = (
         "    // Resolve compact dynamic actors separately",
@@ -164,16 +195,15 @@ def patch_interpreter(root: Path) -> None:
         if compact_start_index >= 0:
             break
     if compact_start_index < 0:
-        raise RuntimeError("per-caster Navi resolve: compact resolve marker not found")
+        raise RuntimeError("stable compact-caster resolve: compact resolve marker not found")
 
     compact_end_line = "    mLargeShadowCasterAccum.clear();"
     compact_end_index = text.find(compact_end_line, compact_start_index)
     if compact_end_index < 0:
-        raise RuntimeError("per-caster Navi resolve: large-caster clear not found")
+        raise RuntimeError("stable compact-caster resolve: large-caster clear not found")
     compact_end_index += len(compact_end_line)
 
-    compact_resolve = r'''    // Compact actors outside Navi's influence retain the stable environmental direction.
-    // No local fill is supplied, so distant actors never brighten merely because Navi exists elsewhere.
+    compact_resolve = r'''    // Ordinary compact actors retain the stable environmental direction.
     const float noLocalFill[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     if (mShadowCasterAccum.size() >= 9) {
         const size_t actorVertexCount = mShadowCasterAccum.size() / 3;
@@ -183,55 +213,69 @@ def patch_interpreter(root: Path) -> None:
             std::clamp(mToonShadowAlpha, 0.0f, 1.0f), kDynamicShadowMapBias, kDynamicShadowMapPcfRadius);
     }
 
-    // Each Navi-affected compact caster is resolved independently. Using one average centre for Link and another
-    // actor made both shadows point from an imaginary light position and stretched the combined silhouette.
+    // Link always reaches this loop. Other compact casters reach it only while inside Navi's small influence.
+    // Each pass owns a floor-locked, texel-snapped anchor and a receiver mask bounded in height and horizontal radius.
     for (const NaviShadowCasterBatch& batch : mNaviShadowCasterBatches) {
-        if (batch.floatCount < 9 || batch.firstFloat + batch.floatCount > mNaviShadowCasterAccum.size() ||
-            mDynamicShadowLocalLight[3] <= 0.0f) {
+        if (batch.floatCount < 9 ||
+            batch.firstFloat + batch.floatCount > mNaviShadowCasterAccum.size()) {
             continue;
         }
 
-        float naviLightDirection[3] = {
-            mDynamicShadowLocalLight[0] - batch.center[0],
-            mDynamicShadowLocalLight[1] - batch.center[1],
-            mDynamicShadowLocalLight[2] - batch.center[2],
+        float casterLightDirection[3] = {
+            mDynamicShadowLightDir[0],
+            mDynamicShadowLightDir[1],
+            mDynamicShadowLightDir[2],
         };
-        float directionLengthSquared = naviLightDirection[0] * naviLightDirection[0] +
-                                       naviLightDirection[1] * naviLightDirection[1] +
-                                       naviLightDirection[2] * naviLightDirection[2];
-        if (directionLengthSquared > 0.000001f) {
-            const float inverseLength = 1.0f / std::sqrt(directionLengthSquared);
-            naviLightDirection[0] *= inverseLength;
-            naviLightDirection[1] *= inverseLength;
-            naviLightDirection[2] *= inverseLength;
+        if (batch.useNaviDirection && mDynamicShadowLocalLight[3] > 0.0f) {
+            casterLightDirection[0] = mDynamicShadowLocalLight[0] - batch.center[0];
+            casterLightDirection[1] = mDynamicShadowLocalLight[1] - batch.center[1];
+            casterLightDirection[2] = mDynamicShadowLocalLight[2] - batch.center[2];
 
-            // The backend approximates the point light with one directional projection per actor. A stronger
-            // minimum elevation prevents a low side-positioned Navi from creating an excessively long silhouette.
-            constexpr float kMinimumNaviElevation = 0.45f;
-            if (naviLightDirection[1] < kMinimumNaviElevation) {
-                const float horizontalLength = std::sqrt(naviLightDirection[0] * naviLightDirection[0] +
-                                                         naviLightDirection[2] * naviLightDirection[2]);
-                const float horizontalTarget = std::sqrt(1.0f - kMinimumNaviElevation * kMinimumNaviElevation);
-                if (horizontalLength > 0.00001f) {
-                    const float horizontalScale = horizontalTarget / horizontalLength;
-                    naviLightDirection[0] *= horizontalScale;
-                    naviLightDirection[2] *= horizontalScale;
-                } else {
-                    naviLightDirection[0] = horizontalTarget;
-                    naviLightDirection[2] = 0.0f;
+            float directionLengthSquared =
+                casterLightDirection[0] * casterLightDirection[0] +
+                casterLightDirection[1] * casterLightDirection[1] +
+                casterLightDirection[2] * casterLightDirection[2];
+            if (directionLengthSquared > 0.000001f) {
+                const float inverseLength = 1.0f / std::sqrt(directionLengthSquared);
+                casterLightDirection[0] *= inverseLength;
+                casterLightDirection[1] *= inverseLength;
+                casterLightDirection[2] *= inverseLength;
+
+                constexpr float kMinimumNaviElevation = 0.45f;
+                if (casterLightDirection[1] < kMinimumNaviElevation) {
+                    const float horizontalLength =
+                        std::sqrt(casterLightDirection[0] * casterLightDirection[0] +
+                                  casterLightDirection[2] * casterLightDirection[2]);
+                    const float horizontalTarget =
+                        std::sqrt(1.0f - kMinimumNaviElevation * kMinimumNaviElevation);
+                    if (horizontalLength > 0.00001f) {
+                        const float horizontalScale = horizontalTarget / horizontalLength;
+                        casterLightDirection[0] *= horizontalScale;
+                        casterLightDirection[2] *= horizontalScale;
+                    } else {
+                        casterLightDirection[0] = horizontalTarget;
+                        casterLightDirection[2] = 0.0f;
+                    }
+                    casterLightDirection[1] = kMinimumNaviElevation;
                 }
-                naviLightDirection[1] = kMinimumNaviElevation;
+            } else {
+                casterLightDirection[0] = mDynamicShadowLightDir[0];
+                casterLightDirection[1] = mDynamicShadowLightDir[1];
+                casterLightDirection[2] = mDynamicShadowLightDir[2];
             }
-        } else {
-            naviLightDirection[0] = mDynamicShadowLightDir[0];
-            naviLightDirection[1] = mDynamicShadowLightDir[1];
-            naviLightDirection[2] = mDynamicShadowLightDir[2];
         }
 
+        // X = collision floor, Y/Z = stable receiver centre, W = reserved sentinel plus receiver radius.
+        const float selfShadowReceiverMask[4] = {
+            batch.receiverFloorY,
+            batch.shadowAnchor[0],
+            batch.shadowAnchor[2],
+            -(8192.0f + batch.receiverRadius),
+        };
         const size_t actorVertexCount = batch.floatCount / 3;
         mRapi->RenderDynamicShadowMap(
-            mNaviShadowCasterAccum.data() + batch.firstFloat, actorVertexCount, effectiveCamera, naviLightDirection,
-            batch.center, noLocalFill, kDynamicShadowMapResolution,
+            mNaviShadowCasterAccum.data() + batch.firstFloat, actorVertexCount, effectiveCamera,
+            casterLightDirection, batch.shadowAnchor, selfShadowReceiverMask, kDynamicShadowMapResolution,
             std::clamp(mToonShadowAlpha, 0.0f, 1.0f), kDynamicShadowMapBias, kDynamicShadowMapPcfRadius);
     }
 
@@ -249,7 +293,7 @@ def main() -> None:
     patch_interpreter_header(root)
     patch_interpreter(root)
     print(
-        "Rendered each compact Navi-affected caster with its own light direction and capped the extra passes."
+        "Rendered Link and Navi-affected compact casters independently with stable floor-locked anchors."
     )
 
 
