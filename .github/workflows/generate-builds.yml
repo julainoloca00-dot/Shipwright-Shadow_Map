@@ -135,6 +135,7 @@ jobs:
           python scripts/fix_shadow_visibility_and_artifacts.py
           python scripts/fix_navi_active_light_state.py
           python scripts/use_navi_direction_for_compact_shadows.py
+          python scripts/prevent_navi_caster_self_shadow.py
 
       - name: Configure sccache
         uses: hendrikmuhs/ccache-action@v1.2
