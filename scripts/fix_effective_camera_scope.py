@@ -153,3 +153,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    from fix_actor_receiver_and_anchor_stability import main as fix_actor_receiver_and_anchor_stability
+
+    fix_actor_receiver_and_anchor_stability()
