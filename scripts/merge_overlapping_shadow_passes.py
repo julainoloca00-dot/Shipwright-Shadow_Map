@@ -29,35 +29,14 @@ def patch_interpreter(root: Path) -> None:
     if "bool beginShadowComposite = true;" not in function:
         function = function.replace(
             marker,
-            "    // The first active layer clears the dedicated composition stencil. Every later layer tests it so\n"
-            "    // overlapping world/actor/Navi shadows merge at one darkness instead of multiplying black.\n"
+            "    // The first active layer clears the dedicated composition stencil. Later layers test it, so\n"
+            "    // overlapping world/actor/Navi shadows keep one darkness instead of multiplying black.\n"
             "    bool beginShadowComposite = true;\n\n" + marker,
             1,
         )
 
-    # Resolve compact actor layers first. The later world layer then fills only stencil pixels that remain clear.
-    # This makes a strong actor/Navi shadow win over a weak locally lifted environment shadow at an overlap.
-    world_start_marker = "    // Resolve static/world and physically large casters first."
-    world_end_line = "    mEnvironmentShadowCasterCache.resize(stableEnvironmentFloats);"
-    world_start = function.find(world_start_marker)
-    world_end = function.find(world_end_line, world_start)
-    if world_start < 0 or world_end < 0:
-        raise RuntimeError("shadow layer ordering: world resolve block not found")
-    world_end += len(world_end_line)
-    world_block = function[world_start:world_end]
-    world_block = world_block.replace(
-        "Resolve static/world and physically large casters first.",
-        "Resolve static/world and physically large casters after compact actors.",
-        1,
-    )
-    function = function[:world_start] + function[world_end:]
-
-    clear_marker = "    mShadowCasterAccum.clear();"
-    clear_pos = function.find(clear_marker)
-    if clear_pos < 0:
-        raise RuntimeError("shadow layer ordering: final actor clear marker not found")
-    function = function[:clear_pos] + world_block + "\n\n" + function[clear_pos:]
-
+    # Keep the existing, already-compiled layer order. The world pass runs first and actor/Navi passes only fill
+    # pixels that were not already shadowed. Moving whole C++ blocks between scopes proved fragile and unnecessary.
     old_tail = "kDynamicShadowMapBias, kDynamicShadowMapPcfRadius);"
     call_count = function.count(old_tail)
     if call_count < 2 or call_count > 8:
@@ -127,7 +106,7 @@ def patch_dx11_backend(root: Path) -> None:
         depthDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
         depthDesc.DepthFunc = D3D11_COMPARISON_ALWAYS;
         // Reserve stencil bit 7 for dynamic-shadow composition. A fragment passes only while the bit is clear,
-        // then REPLACE writes it. This combines overlapping shadow coverage instead of repeatedly blending black.
+        // then REPLACE writes it. This combines coverage instead of repeatedly alpha-blending black over black.
         depthDesc.StencilEnable = TRUE;
         depthDesc.StencilReadMask = 0x80;
         depthDesc.StencilWriteMask = 0x80;
@@ -144,8 +123,11 @@ def patch_dx11_backend(root: Path) -> None:
     new_ensure = '''    const size_t vertexBytes = vertexCount * 3 * sizeof(float);
     EnsureDynamicShadowResources(std::max<uint32_t>(64, resolution), vertexBytes);
 
-    // The scene depth texture is sampled by the resolve shader, so it cannot simultaneously be rebound as a
-    // writable stencil DSV. Allocate a tiny-purpose screen-sized depth/stencil resource for composition only.
+    // The scene depth texture is sampled by the resolve shader, so it cannot also be rebound as writable stencil.
+    // Use a separate screen-sized depth/stencil texture that only stores the composition bit.
+    if (framebuffer.texture_id >= mTextures.size() || !mTextures[framebuffer.texture_id].texture) {
+        return;
+    }
     D3D11_TEXTURE2D_DESC frameColorDesc = {};
     mTextures[framebuffer.texture_id].texture->GetDesc(&frameColorDesc);
     const bool rebuildCompositeStencil =
@@ -162,7 +144,7 @@ def patch_dx11_backend(root: Path) -> None:
         stencilTextureDesc.Height = frameColorDesc.Height;
         stencilTextureDesc.MipLevels = 1;
         stencilTextureDesc.ArraySize = 1;
-        stencilTextureDesc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+        stencilTextureDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
         stencilTextureDesc.SampleDesc = frameColorDesc.SampleDesc;
         stencilTextureDesc.Usage = D3D11_USAGE_DEFAULT;
         stencilTextureDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
@@ -171,10 +153,10 @@ def patch_dx11_backend(root: Path) -> None:
 
         D3D11_DEPTH_STENCIL_VIEW_DESC stencilViewDesc = {};
         stencilViewDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-        stencilViewDesc.ViewDimension = frameColorDesc.SampleDesc.Count > 1
-                                            ? D3D11_DSV_DIMENSION_TEXTURE2DMS
-                                            : D3D11_DSV_DIMENSION_TEXTURE2D;
-        if (frameColorDesc.SampleDesc.Count == 1) {
+        if (frameColorDesc.SampleDesc.Count > 1) {
+            stencilViewDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
+        } else {
+            stencilViewDesc.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
             stencilViewDesc.Texture2D.MipSlice = 0;
         }
         ThrowIfFailed(mDevice->CreateDepthStencilView(mDynamicShadowCompositeStencilTexture.Get(), &stencilViewDesc,
@@ -227,8 +209,7 @@ def patch_dx11_backend(root: Path) -> None:
     new_shader = '''    const bool casterReceiverOnly = localLight.w <= -4096.0;
     float receiverFade = 1.0;
     if (casterReceiverOnly) {
-        // Keep the caster body excluded, but fade the cutoff over a short vertical band so a platform edge cannot
-        // reveal a hard rectangular boundary in the projected actor shadow.
+        // Fade the receiver cutoff over a short vertical band so a platform edge cannot reveal a hard rectangle.
         const float receiverFadeHeight = 12.0;
         receiverFade = saturate((localLight.x + receiverFadeHeight - world.y) / receiverFadeHeight);
         if (receiverFade <= 0.001) discard;
@@ -244,8 +225,7 @@ def patch_dx11_backend(root: Path) -> None:
     const float localShadowScale = 1.0 - localFill * localFillStrength;
     const float resolvedShadowAlpha =
         saturate(shadowParams.x * shadow * edgeFade * localShadowScale * receiverFade);
-    // Zero-alpha fragments must be discarded; otherwise they would still write stencil and incorrectly block a
-    // later layer that contains a real shadow at the same pixel.
+    // Zero-alpha fragments must not write stencil, or they would block a later real shadow at the same pixel.
     if (resolvedShadowAlpha <= 0.01) discard;
     return float4(0.0, 0.0, 0.0, resolvedShadowAlpha);'''
     shader_count = text.count(old_shader)
@@ -261,9 +241,7 @@ def main() -> None:
     patch_interpreter(root)
     patch_dx11_header(root)
     patch_dx11_backend(root)
-    print(
-        "Merged overlapping dynamic-shadow layers through a dedicated stencil and softened the receiver cutoff."
-    )
+    print("Merged overlapping shadow layers without moving C++ resolve blocks and softened the receiver cutoff.")
 
 
 if __name__ == "__main__":
