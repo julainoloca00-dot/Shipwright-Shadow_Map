@@ -133,6 +133,7 @@ jobs:
           python scripts/prepare_shadow_local_fill.py
           python scripts/fix_shadow_msvc_compile.py
           python scripts/fix_shadow_visibility_and_artifacts.py
+          python scripts/fix_navi_active_light_state.py
 
       - name: Configure sccache
         uses: hendrikmuhs/ccache-action@v1.2
