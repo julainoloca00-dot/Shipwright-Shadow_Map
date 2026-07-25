@@ -14,21 +14,6 @@ jobs:
     if: github.event.pull_request.head.ref == 'cleanup-all-extra-branches'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: wind-waker-style-cel-shading
-          fetch-depth: 0
-
-      - name: Restore original workflow
-        shell: bash
-        run: |
-          git checkout 1f6b86e1d1323c1a20f159171695f53698618d88 -- .github/workflows/generate-builds.yml
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .github/workflows/generate-builds.yml
-          git commit -m "Restore Windows manual build workflow"
-          git push origin HEAD:wind-waker-style-cel-shading
-
       - name: Delete every non-default branch
         shell: bash
         env:
