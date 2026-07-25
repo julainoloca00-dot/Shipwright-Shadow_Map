@@ -29,7 +29,7 @@ def patch_interpreter(root: Path) -> None:
     if "bool beginShadowComposite = true;" not in function:
         function = function.replace(
             marker,
-            "    // The first active layer clears the reserved stencil bit. Every later layer tests that bit so\n"
+            "    // The first active layer clears the dedicated composition stencil. Every later layer tests it so\n"
             "    // overlapping world/actor/Navi shadows merge at one darkness instead of multiplying black.\n"
             "    bool beginShadowComposite = true;\n\n" + marker,
             1,
@@ -51,6 +51,28 @@ def patch_interpreter(root: Path) -> None:
     path.write_text(text, encoding="utf-8", newline="\n")
 
 
+def patch_dx11_header(root: Path) -> None:
+    path = root / "libultraship/include/fast/backends/gfx_direct3d_common.h"
+    text = path.read_text(encoding="utf-8")
+
+    if "mDynamicShadowCompositeStencilTexture" not in text:
+        marker = '''    Microsoft::WRL::ComPtr<ID3D11SamplerState> mDynamicShadowComparisonSampler;
+    DynamicShadowCB mDynamicShadowCbData{};'''
+        replacement = '''    Microsoft::WRL::ComPtr<ID3D11SamplerState> mDynamicShadowComparisonSampler;
+    // Dedicated screen-sized stencil used only to merge overlapping dynamic-shadow layers. It must not share
+    // the scene depth resource because the resolve shader samples that resource at the same time.
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> mDynamicShadowCompositeStencilTexture;
+    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> mDynamicShadowCompositeStencilDsv;
+    uint32_t mDynamicShadowCompositeWidth = 0;
+    uint32_t mDynamicShadowCompositeHeight = 0;
+    uint32_t mDynamicShadowCompositeSampleCount = 0;
+    uint32_t mDynamicShadowCompositeSampleQuality = 0;
+    DynamicShadowCB mDynamicShadowCbData{};'''
+        text = replace_once(text, marker, replacement, "DX11 dedicated shadow-composition stencil members")
+
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
 def patch_dx11_backend(root: Path) -> None:
     path = root / "libultraship/src/fast/backends/gfx_direct3d11_shadow_map.inc"
     text = path.read_text(encoding="utf-8")
@@ -66,7 +88,7 @@ def patch_dx11_backend(root: Path) -> None:
             signature
             + '''
     // Interpreter encodes the first active shadow layer with a negative PCF value. Decode it here and clear
-    // the reserved stencil bit exactly once, so subsequent layers can skip pixels that are already shadowed.
+    // the dedicated composition stencil exactly once, so later layers skip pixels that are already shadowed.
     const bool beginShadowComposite = pcfRadius < 0;
     if (beginShadowComposite) {
         pcfRadius = -pcfRadius - 1;
@@ -82,8 +104,7 @@ def patch_dx11_backend(root: Path) -> None:
         depthDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
         depthDesc.DepthFunc = D3D11_COMPARISON_ALWAYS;
         // Reserve stencil bit 7 for dynamic-shadow composition. A fragment passes only while the bit is clear,
-        // then REPLACE writes it. This is equivalent to combining shadow visibility with min() instead of
-        // repeatedly alpha-blending black over black.
+        // then REPLACE writes it. This combines overlapping shadow coverage instead of repeatedly blending black.
         depthDesc.StencilEnable = TRUE;
         depthDesc.StencilReadMask = 0x80;
         depthDesc.StencilWriteMask = 0x80;
@@ -95,24 +116,70 @@ def patch_dx11_backend(root: Path) -> None:
         ThrowIfFailed(mDevice->CreateDepthStencilState(&depthDesc, mDynamicShadowResolveDepthState.GetAddressOf()));'''
     text = replace_once(text, old_resolve_state, new_resolve_state, "DX11 overlap stencil state")
 
+    old_ensure = '''    const size_t vertexBytes = vertexCount * 3 * sizeof(float);
+    EnsureDynamicShadowResources(std::max<uint32_t>(64, resolution), vertexBytes);'''
+    new_ensure = '''    const size_t vertexBytes = vertexCount * 3 * sizeof(float);
+    EnsureDynamicShadowResources(std::max<uint32_t>(64, resolution), vertexBytes);
+
+    // The scene depth texture is sampled by the resolve shader, so it cannot simultaneously be rebound as a
+    // writable stencil DSV. Allocate a tiny-purpose screen-sized depth/stencil resource for composition only.
+    D3D11_TEXTURE2D_DESC frameColorDesc = {};
+    mTextures[framebuffer.texture_id].texture->GetDesc(&frameColorDesc);
+    const bool rebuildCompositeStencil =
+        !mDynamicShadowCompositeStencilTexture || mDynamicShadowCompositeWidth != frameColorDesc.Width ||
+        mDynamicShadowCompositeHeight != frameColorDesc.Height ||
+        mDynamicShadowCompositeSampleCount != frameColorDesc.SampleDesc.Count ||
+        mDynamicShadowCompositeSampleQuality != frameColorDesc.SampleDesc.Quality;
+    if (rebuildCompositeStencil) {
+        mDynamicShadowCompositeStencilDsv.Reset();
+        mDynamicShadowCompositeStencilTexture.Reset();
+
+        D3D11_TEXTURE2D_DESC stencilTextureDesc = {};
+        stencilTextureDesc.Width = frameColorDesc.Width;
+        stencilTextureDesc.Height = frameColorDesc.Height;
+        stencilTextureDesc.MipLevels = 1;
+        stencilTextureDesc.ArraySize = 1;
+        stencilTextureDesc.Format = DXGI_FORMAT_R24G8_TYPELESS;
+        stencilTextureDesc.SampleDesc = frameColorDesc.SampleDesc;
+        stencilTextureDesc.Usage = D3D11_USAGE_DEFAULT;
+        stencilTextureDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        ThrowIfFailed(mDevice->CreateTexture2D(&stencilTextureDesc, nullptr,
+                                               mDynamicShadowCompositeStencilTexture.GetAddressOf()));
+
+        D3D11_DEPTH_STENCIL_VIEW_DESC stencilViewDesc = {};
+        stencilViewDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        stencilViewDesc.ViewDimension = frameColorDesc.SampleDesc.Count > 1
+                                            ? D3D11_DSV_DIMENSION_TEXTURE2DMS
+                                            : D3D11_DSV_DIMENSION_TEXTURE2D;
+        if (frameColorDesc.SampleDesc.Count == 1) {
+            stencilViewDesc.Texture2D.MipSlice = 0;
+        }
+        ThrowIfFailed(mDevice->CreateDepthStencilView(mDynamicShadowCompositeStencilTexture.Get(), &stencilViewDesc,
+                                                      mDynamicShadowCompositeStencilDsv.GetAddressOf()));
+
+        mDynamicShadowCompositeWidth = frameColorDesc.Width;
+        mDynamicShadowCompositeHeight = frameColorDesc.Height;
+        mDynamicShadowCompositeSampleCount = frameColorDesc.SampleDesc.Count;
+        mDynamicShadowCompositeSampleQuality = frameColorDesc.SampleDesc.Quality;
+    }'''
+    text = replace_once(text, old_ensure, new_ensure, "DX11 dedicated composition stencil allocation")
+
     old_saved_targets = '''    ComPtr<ID3D11RenderTargetView> savedRtv;
     ComPtr<ID3D11DepthStencilView> savedDsv;
     mContext->OMGetRenderTargets(1, savedRtv.GetAddressOf(), savedDsv.GetAddressOf());'''
     new_saved_targets = '''    ComPtr<ID3D11RenderTargetView> savedRtv;
     ComPtr<ID3D11DepthStencilView> savedDsv;
     mContext->OMGetRenderTargets(1, savedRtv.GetAddressOf(), savedDsv.GetAddressOf());
-    if (beginShadowComposite && savedDsv) {
-        // World-light volumes have already been drawn at this point. Clear stencil for the shadow layers so the
-        // first real shadow owns each pixel and later overlapping layers merge without additional darkening.
-        mContext->ClearDepthStencilView(savedDsv.Get(), D3D11_CLEAR_STENCIL, 1.0f, 0);
+    if (beginShadowComposite && mDynamicShadowCompositeStencilDsv) {
+        mContext->ClearDepthStencilView(mDynamicShadowCompositeStencilDsv.Get(), D3D11_CLEAR_STENCIL, 1.0f, 0);
     }'''
-    text = replace_once(text, old_saved_targets, new_saved_targets, "DX11 stencil clear before first shadow layer")
+    text = replace_once(text, old_saved_targets, new_saved_targets, "DX11 dedicated stencil clear")
 
     text = replace_once(
         text,
         "    mContext->OMSetRenderTargets(1, &resolveRtv, nullptr);",
-        "    mContext->OMSetRenderTargets(1, &resolveRtv, savedDsv.Get());",
-        "DX11 bind scene stencil during shadow resolve",
+        "    mContext->OMSetRenderTargets(1, &resolveRtv, mDynamicShadowCompositeStencilDsv.Get());",
+        "DX11 bind dedicated composition stencil",
     )
     text = replace_once(
         text,
@@ -137,8 +204,8 @@ def patch_dx11_backend(root: Path) -> None:
     new_shader = '''    const bool casterReceiverOnly = localLight.w <= -4096.0;
     float receiverFade = 1.0;
     if (casterReceiverOnly) {
-        // Keep the caster body excluded, but fade the receiver cutoff over a short vertical band so a platform
-        // edge cannot reveal a hard rectangular boundary in the projected actor shadow.
+        // Keep the caster body excluded, but fade the cutoff over a short vertical band so a platform edge cannot
+        // reveal a hard rectangular boundary in the projected actor shadow.
         const float receiverFadeHeight = 12.0;
         receiverFade = saturate((localLight.x + receiverFadeHeight - world.y) / receiverFadeHeight);
         if (receiverFade <= 0.001) discard;
@@ -169,9 +236,10 @@ def patch_dx11_backend(root: Path) -> None:
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     patch_interpreter(root)
+    patch_dx11_header(root)
     patch_dx11_backend(root)
     print(
-        "Merged overlapping dynamic-shadow layers through stencil and softened the Navi caster receiver cutoff."
+        "Merged overlapping dynamic-shadow layers through a dedicated stencil and softened the receiver cutoff."
     )
 
 
